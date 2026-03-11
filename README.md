@@ -1,30 +1,83 @@
-# Router-weighted Expert Activation Pruning (REAP)
+# REAM: Router-weighted Expert Activation Merging
 
-## Summary
-<img src="./fig/reaper.png" align="right" alt="REAP the experts" width="400">
-This repository contains code required to reproduce the expert pruning and merging methods used in the paper: <a href="https://arxiv.org/abs/2510.13999">REAP the Experts: Why Pruning Prevails for One-Shot MoE compression</a>
-<br></br> 
-Expert pruning and merging can be used to reduce the memory overhead of Sparsely-activated Mixture-of-Experts (SMoE) LLMs. Our novel expert pruning criterion, Router-weighted Expert Activation Pruning (REAP) considers both router gate-values and expert activation norms. Across a diverse set of SMoE models ranging from 20B to 1T parameters, REAP consistently outperforms merging and other pruning methods on generative benchmarks, especially at 50% compression. Notably, our method achieves near-lossless compression on code generation and tool-calling tasks with Qwen3-Coder-480B and Kimi-K2, even after pruning 50% of experts.   
-<br></br>
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/JackBinary/REAM/blob/main/ream_colab.ipynb)
 
-**Our main contributions are as follows:**
-- We prove that expert merging introduces *irreducible error* due to the loss of the router's independent, input-dependant modulation of the expert outputs resulting in *functional subspace collapse*, substantially reducing the functional output space of the compressed SMoE layer. In contrast, in expert pruned SMoEs the router maintains independent control over the remaining experts;
-- We introduce REAP, a novel expert pruning saliency criterion, which selects experts to prune which contribute minimally to the layer output by considering both the router gate-values and average activation norm of the experts;
-- Across diverse SMoE architectures ranging from 20B to 1T parameters and a suite of generative evaluations, we demonstrate the significant and consistent advantage of REAP over existing expert pruning and merging approaches, particularly at 50% compression. Notably, our method achieves near-lossless compression on code generation tasks after pruning 50% of experts from Qwen3-Coder-480B and Kimi-K2.
+Fork of [CerebrasResearch/reap](https://github.com/CerebrasResearch/reap) implementing REAM ([blog post](https://bknyaz.github.io/blog/2026/moe/)) instead of REAP.
 
-## Results
-**Compressed GLM-4.5 Air (left) & Qwen3-30B-A3B (right) on non-agentic coding, mathematical reasoning, creative writing, and multiple choice (MC) benchmarks using a variety of compression methods.**
-![Qwen/GLM](./fig/combined-all-tasks_qwen_and_glm.png)
+## What is REAM?
 
-**Accuracy vs. parameters across all models and compression methods for non-agentic coding (left) and multiple choice (MC) (right)**
-![Accuracy vs. params](./fig/combined_performance_vs_params.png)
+REAM compresses Mixture-of-Experts LLMs by **merging** groups of experts rather than pruning them. It reduces the expert count by 25% (e.g., 128 → 96) with strong benchmark retention across Qwen3-30B, Qwen3-235B, and Qwen3-Next-80B.
 
-**Large-scale pruned SMoEs on agentic, non-agentic coding, tool-use tasks, and multiple choice (MC) benchmarks.**
-![large-scale pruned SMoE results](./fig/large-scale-moe.png)
+Six things make REAM different from prior merging methods like HC-SMoE:
 
+1. **REAP-score centroids** — The k retained experts are chosen by REAP saliency (router-gate-weighted activation norms), not by frequency.
+2. **Pseudo-pruning grouping** — Starting from the highest-scoring centroid, the C most similar unassigned experts are grouped with it. Most groups end up as singletons; a few grow large. The weighted merge is dominated by the centroid, hence "pseudo-pruning."
+3. **Gated similarity** — Expert similarity is the average of (a) cosine similarity of expert outputs weighted by gate values and (b) cosine similarity of gate logit columns.
+4. **Activation + weight permutation alignment** — Before averaging, expert neurons are aligned using the Hungarian algorithm on a cost matrix combining hidden-activation distances and concatenated-weight distances.
+5. **Sequential layer processing** — Each layer is merged, then calibration data is re-forwarded through the updated model before merging the next layer. Prior methods compute all activations from the original model upfront.
+6. **Gate weight pruning** — After merging, non-centroid rows are removed from the router weight matrix (following REAP's gate adjustment).
 
-## <img src="./fig/hf-transparent.png" alt="Qwen3-Coder-REAP-246B-A35B-FP8" width='20'>  HuggingFace checkpoints
-[REAP model collection on HuggingFace](https://huggingface.co/collections/cerebras/cerebras-reap), including pruned versions of GLM4.6, GLM4.5-Air, Qwen3-Coder-480B, Qwen3-Coder-30B, MiniMax-M2, Kimi-Linear, DeepSeek-V3.2. More to come, stay tuned!
+## Results (from the [blog post](https://bknyaz.github.io/blog/2026/moe/))
+
+| Model | Experts | Method | MC avg | GEN avg |
+|---|---|---|---|---|
+| Qwen3-30B-A3B | 128 (original) | — | 69.7 | 70.9 |
+| Qwen3-30B-A3B | 96 | HC-SMoE | 64.8 | 66.3 |
+| Qwen3-30B-A3B | 96 | REAP | 65.2 | 64.1 |
+| Qwen3-30B-A3B | 96 | **REAM** | **65.8** | **67.7** |
+| Qwen3-235B-A22B | 96 | REAP | — | 72.9 |
+| Qwen3-235B-A22B | 96 | **REAM** | — | 71.7 |
+| Qwen3-Next-80B | 384 | REAP | — | 68.5 |
+| Qwen3-Next-80B | 384 | **REAM** | — | **69.3** |
+
+## Calibration Data
+
+REAM uses a fixed mix of 2048 sequences:
+
+| Domain | Dataset | Samples | Max tokens | Share |
+|---|---|---|---|---|
+| General | allenai/c4/en | 512 | 128 | 8% |
+| Math | AI-MO/NuminaMath-1.5 (cn_k12, olympiads) | 1024 | 512 | 68% |
+| Coding | bigcode/the-stack-smol | 512 | 512 | 24% |
+
+## Quick Start
+
+```bash
+# Install
+bash scripts/build.sh
+
+# Run REAM on Qwen3-30B-A3B (25% compression, GPU 0)
+bash experiments/ream-cli.sh 0
+
+# Custom model and compression ratio
+bash experiments/ream-cli.sh 0,1 Qwen/Qwen3-30B-A3B 42 0.25 16
+```
+
+## New Files
+
+| File | Purpose |
+|---|---|
+| `src/reap/ream.py` | Main pipeline: sequential merging, gate pruning, calibration data loading |
+| `src/reap/ream_cluster.py` | REAM clustering: REAP-score centroids, pseudo-pruning, gated similarity |
+| `experiments/ream-cli.sh` | CLI wrapper for running REAM experiments |
+
+Modified from REAP:
+
+| File | Change |
+|---|---|
+| `src/reap/permute.py` | Added `ActivationWeightPermuter` (activation + weight cost matrix) |
+| `src/reap/data.py` | Added `NuminaMathLMDataset`, `TheStackSmolLMDataset` processors |
+| `src/reap/args.py` | Added `ream_mixed`, `AI-MO/NuminaMath-1.5`, `bigcode/the-stack-smol` to dataset choices |
+| `pyproject.toml` | Renamed to `ream`, added `scipy` dependency |
+
+---
+
+## Original REAP Documentation
+
+Everything below is from the original REAP repository. The REAP pruning and merging pipelines remain fully functional.
+
+---
+
 
 ## Installation
 
@@ -125,7 +178,15 @@ The `src/reap` directory contains the main codebase:
 
 
 ## Citation
-Please consider using the following citation if you found this work useful:
+Please consider using the following citations if you found this work useful:
+```
+@misc{knyazev2026compressing,
+    title       = {REAM: Compressing Mixture-of-Experts LLMs},
+    author      = {Boris Knyazev},
+    year        = {2026},
+    url         = {https://bknyaz.github.io/blog/2026/moe/},
+}
+```
 ```
 @misc{lasby-reap,
     title       = {{REAP the Experts: Why Pruning Prevails for One-Shot MoE compression}},

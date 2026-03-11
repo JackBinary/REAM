@@ -83,6 +83,9 @@ class DatasetArgs:
                 "theblackcat102/evol-codealpaca-v1",
                 "euclaise/WritingPrompts_curated",
                 "allenai/tulu-3-sft-personas-math",
+                "AI-MO/NuminaMath-1.5",
+                "bigcode/the-stack-smol",
+                "ream_mixed",
                 "combined"
             ],
         },

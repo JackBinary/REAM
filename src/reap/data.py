@@ -423,6 +423,27 @@ class WritingPromptsChatDataset(ChatDatasetProcessor):
 
 
 
+class NuminaMathLMDataset(LMDatasetProcessor):
+    """Dataset for AI-MO/NuminaMath-1.5 (cn_k12, olympiads subsets)."""
+
+    category_field: str = "source"
+
+    @staticmethod
+    def _map_fn(sample: dict[str, any]) -> dict[str, any]:
+        text = (sample.get("problem", "") + "\n" + sample.get("solution", "")).strip()
+        return {"text": text, "source": sample.get("source", "unknown")}
+
+
+class TheStackSmolLMDataset(LMDatasetProcessor):
+    """Dataset for bigcode/the-stack-smol."""
+
+    category_field: str = None
+
+    @staticmethod
+    def _map_fn(sample: dict[str, any]) -> dict[str, any]:
+        return {"text": sample.get("content", "")}
+
+
 DATASET_REGISTRY: dict[str, BaseDatasetProcessor] = {
     "m-a-p/CodeFeedback-Filtered-Instruction": CodeFeedbackChatDataset,
     "allenai/tulu-3-sft-mixture": TuluSFTMixtureChatDataset,
@@ -432,4 +453,6 @@ DATASET_REGISTRY: dict[str, BaseDatasetProcessor] = {
     "theblackcat102/evol-codealpaca-v1": CodeAlpacaChatDataset,
     "euclaise/WritingPrompts_curated": WritingPromptsChatDataset,
     "allenai/tulu-3-sft-personas-math": PersonasMathChatDataset,
+    "AI-MO/NuminaMath-1.5": NuminaMathLMDataset,
+    "bigcode/the-stack-smol": TheStackSmolLMDataset,
 }

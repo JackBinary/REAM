@@ -312,7 +312,101 @@ class DirectAlignmentPermuter(ExpertPermuter):
         down_proj.weight.data = down_proj.weight.data[permutation, :]
 
 
+class ActivationWeightPermuter(ExpertPermuter):
+    """
+    REAM-style permutation alignment using both hidden activations and weights.
+
+    From the REAM blog post (Step 5):
+      cost1 = cdist(hidden[0], hidden[i])     # activation-based
+      cost2 = cdist(weights[0], weights[i])    # weight-based
+      perm = linear_sum_assignment(cost1 + cost2)
+
+    This combines information from how experts behave (activations) with
+    their parameter structure (weights) for better alignment before merging.
+    """
+
+    def __init__(self, model_attrs: dict[str, Any], expert_hidden: dict[int, torch.Tensor] | None = None):
+        """
+        Args:
+            model_attrs: Model attribute names dict.
+            expert_hidden: Dict mapping expert_index -> (d, n) hidden activation tensor.
+                           d = bottleneck dim, n = num tokens.
+                           If None, falls back to weight-only matching.
+        """
+        super().__init__(model_attrs)
+        self.expert_hidden = expert_hidden or {}
+
+    def _permute(
+        self,
+        experts: list[nn.Module],
+        expert_indices: list[int],
+        dom_expert_idx: int,
+    ):
+        """Permutes experts using combined activation + weight matching."""
+        import copy
+
+        dom_expert = experts[dom_expert_idx]
+        dom_weights = self._get_concat_weights(dom_expert)
+
+        # Get dominant expert hidden activations if available
+        dom_hidden = self.expert_hidden.get(dom_expert_idx)
+
+        for expert_idx in expert_indices:
+            if expert_idx == dom_expert_idx:
+                continue
+
+            expert = experts[expert_idx]
+            orig_expert = copy.deepcopy(expert)
+            expert_weights = self._get_concat_weights(expert)
+
+            # Weight-based cost matrix
+            cost_weight = torch.cdist(dom_weights, expert_weights, p=2)
+
+            # Activation-based cost matrix (if available)
+            expert_hidden = self.expert_hidden.get(expert_idx)
+            if dom_hidden is not None and expert_hidden is not None:
+                cost_activation = torch.cdist(dom_hidden, expert_hidden, p=2)
+                cost_matrix = cost_activation + cost_weight
+            else:
+                cost_matrix = cost_weight
+
+            cost_matrix_np = cost_matrix.cpu().to(torch.float32).numpy()
+            row_ind, col_ind = linear_sum_assignment(cost_matrix_np)
+            permutation = torch.tensor(col_ind, dtype=torch.long).argsort()
+
+            # Apply permutation to hidden dimension (rows of up/gate, cols of down)
+            WeightMatchingPermuter.apply_permutation(
+                WeightMatchingPermuter, expert, permutation, self.model_attrs
+            )
+
+            logger.debug("Checking expert %d with activation+weight permutation...", expert_idx)
+            self._run_assertions(expert, orig_expert, cost_matrix_np, row_ind, col_ind)
+
+    def _get_concat_weights(self, expert: nn.Module) -> torch.Tensor:
+        """
+        Concatenate expert weight matrices: [gate; up; down^T] along dim=1.
+        Result shape: (d_bottleneck, d_model * 3) matching blog pseudocode.
+        """
+        gate_w = getattr(expert, self.model_attrs["gate_proj"]).weight  # (d, d_model)
+        up_w = getattr(expert, self.model_attrs["up_proj"]).weight      # (d, d_model)
+        down_w = getattr(expert, self.model_attrs["down_proj"]).weight  # (d_model, d)
+        return torch.cat([gate_w, up_w, down_w.T], dim=1).float()
+
+    def _fused_permute(
+        self,
+        experts: nn.Module,
+        expert_indices: list[int],
+        dom_expert_idx: int,
+    ):
+        """Fused expert permutation not implemented for activation+weight method."""
+        raise NotImplementedError(
+            "ActivationWeightPermuter does not support fused experts. "
+            "Use WeightMatchingPermuter for fused models."
+        )
+
+
 PERMUTER_REGISTRY = {
     "wm": WeightMatchingPermuter,
     "direct": DirectAlignmentPermuter,
+    "activation_weight": ActivationWeightPermuter,
 }

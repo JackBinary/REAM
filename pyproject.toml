@@ -1,7 +1,7 @@
 [project]
-name = "reap"
+name = "ream"
 version = "0.1.0"
-description = "reap: MoE Compression with expert pruning and merging."
+description = "REAM: Router-weighted Expert Activation Merging for MoE LLM compression. Fork of REAP."
 readme = "README.md"
 authors = [
     { name = "Mike Lasby", email = "mklasby@gmail.com" }
@@ -30,6 +30,7 @@ dependencies = [
     "wandb>=0.21.1",
     "crfm-helm",
     "evalscope",
+    "scipy>=1.14.0",
 ]
 
 [tool.uv.sources]
