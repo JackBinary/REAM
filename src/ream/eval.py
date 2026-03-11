@@ -17,8 +17,8 @@ from vllm.entrypoints.openai.api_server import run_server
 from vllm.engine.arg_utils import AsyncEngineArgs
 import uvloop
 
-from reap.args import ReapArgs, ModelArgs, EvalArgs
-from reap.model_util import patched_model_map, MODEL_ATTRS
+from ream.args import ReapArgs, ModelArgs, EvalArgs
+from ream.model_util import patched_model_map, MODEL_ATTRS
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)

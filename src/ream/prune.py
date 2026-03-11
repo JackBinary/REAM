@@ -16,8 +16,8 @@ from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
 
 
-from reap.main import record_activations, smoke_test, create_results_directory
-from reap.args import (
+from ream.main import record_activations, smoke_test, create_results_directory
+from ream.args import (
     ReapArgs,
     ModelArgs,
     EvalArgs,
@@ -26,14 +26,14 @@ from reap.args import (
     DatasetArgs,
     ClusterArgs,
 )
-from reap.data import DATASET_REGISTRY
-from reap.cluster import (
+from ream.data import DATASET_REGISTRY
+from ream.cluster import (
     get_penalty_vector,
     hierarchical_clustering,
     dynamic_frequency_penalized_clustering,
 )
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
-from reap.eval import run_evaluate
+from ream.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
+from ream.eval import run_evaluate
 import shutil
 
 logger = logging.getLogger(__name__)

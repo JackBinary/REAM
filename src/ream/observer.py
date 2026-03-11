@@ -13,7 +13,7 @@ import logging
 import pathlib
 from functools import reduce
 
-from reap.metrics import (
+from ream.metrics import (
     ttm_online,
     get_routed_characteristic_activation,
     ca_dist_online,

@@ -24,7 +24,7 @@ from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
 
 
-from reap.args import (
+from ream.args import (
     ReapArgs,
     ModelArgs,
     DatasetArgs,
@@ -34,10 +34,10 @@ from reap.args import (
     EvalArgs,
     MergeArgs,
 )
-from reap.merge import MergeMethod, MoEExpertMerger
-from reap.data import DATASET_REGISTRY
-from reap.observer import OBSERVER_CONFIG_REGISTRY, MoETransformerObserver
-from reap.cluster import (
+from ream.merge import MergeMethod, MoEExpertMerger
+from ream.data import DATASET_REGISTRY
+from ream.observer import OBSERVER_CONFIG_REGISTRY, MoETransformerObserver
+from ream.cluster import (
     get_penalty_vector,
     hierarchical_clustering,
     dynamic_frequency_penalized_clustering,
@@ -48,10 +48,10 @@ from reap.cluster import (
     restricted_hierarchical_clustering,
     kmeans_clustering
 )
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
-from reap.eval import run_evaluate
-from reap.cluster_plots import plot_cluster_analysis
-from reap.metrics import get_distance_fn
+from ream.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
+from ream.eval import run_evaluate
+from ream.cluster_plots import plot_cluster_analysis
+from ream.metrics import get_distance_fn
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)

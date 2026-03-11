@@ -32,7 +32,7 @@ from datasets import load_dataset
 from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
 
-from reap.args import (
+from ream.args import (
     ReapArgs,
     ModelArgs,
     DatasetArgs,
@@ -42,15 +42,15 @@ from reap.args import (
     EvalArgs,
     MergeArgs,
 )
-from reap.merge import MergeMethod, MoEExpertMerger
-from reap.model_util import (
+from ream.merge import MergeMethod, MoEExpertMerger
+from ream.model_util import (
     MODEL_ATTRS, patched_model_map, get_moe, assert_merge,
     get_layers, get_num_experts, fused_expert_forward, load_model_text_only,
 )
-from reap.permute import ActivationWeightPermuter, PERMUTER_REGISTRY
-from reap.ream_cluster import ream_clustering
-from reap.eval import run_evaluate
-from reap.main import (
+from ream.permute import ActivationWeightPermuter, PERMUTER_REGISTRY
+from ream.ream_cluster import ream_clustering
+from ream.eval import run_evaluate
+from ream.main import (
     parse_args,
     create_results_directory,
     save_merged_model,
@@ -675,10 +675,10 @@ def main():
         )
     else:
         # Fall back to single dataset mode
-        from reap.main import record_activations
+        from ream.main import record_activations
         logger.info(f"Using single dataset: {ds_args.dataset_name}")
         # Use the standard observer pipeline to get calibration data
-        from reap.data import DATASET_REGISTRY
+        from ream.data import DATASET_REGISTRY
         raw_ds = load_dataset(ds_args.dataset_name, split=ds_args.split)
         proc_cls = DATASET_REGISTRY.get(ds_args.dataset_name)
         if proc_cls is None:

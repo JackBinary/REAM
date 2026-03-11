@@ -10,8 +10,8 @@ from enum import Enum
 import torch
 import torch.nn as nn
 
-from reap.model_util import MODEL_ATTRS
-from reap.permute import (
+from ream.model_util import MODEL_ATTRS
+from ream.permute import (
     DirectAlignmentPermuter,
     assert_improved_weight_dist,
     assert_not_equal,
