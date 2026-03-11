@@ -75,16 +75,28 @@ def collect_layer_data(
     layer_idx: int,
     model_attrs: dict[str, Any],
     device: torch.device,
+    max_sim_tokens: int = 65536,
+    max_hidden_tokens: int = 8192,
 ) -> dict[str, torch.Tensor]:
     """
     Forward calibration data through the model up to and including the target
     MoE layer, collecting expert outputs, gate logits, and computing REAP scores.
 
+    Memory-efficient: REAP scores are computed incrementally (running sums).
+    Only a capped reservoir of tokens is kept for the similarity matrix used
+    during clustering, and expert_hidden is capped per expert.
+
+    Args:
+        max_sim_tokens: Maximum tokens to retain for the gated-similarity matrix.
+            4096 is plenty for accurate cosine similarity estimation.
+        max_hidden_tokens: Maximum tokens per expert to retain for permutation
+            alignment in expert_hidden.
+
     Returns a dict with:
       - reap_scores: (N,) per-expert REAP saliency
-      - expert_outputs: (N, total_tokens, hidden_dim) all expert activations
-      - gate_logits: (total_tokens, N) softmax router outputs
-      - expert_hidden: dict[int, (d, total_tokens)] hidden activations per expert
+      - expert_outputs: (N, <=max_sim_tokens, hidden_dim) sampled expert activations
+      - gate_logits: (<=max_sim_tokens, N) sampled softmax router outputs
+      - expert_hidden: dict[int, (d, <=max_hidden_tokens)] hidden activations per expert
       - expert_frequency: (N,) how often each expert is selected
     """
     moe = get_moe(model, layer_idx)
@@ -98,25 +110,24 @@ def collect_layer_data(
     cfg = getattr(model.config, "text_config", model.config)
     topk = getattr(cfg, topk_key, 8)
 
-    all_expert_outputs = []
-    all_gate_logits = []
-    all_hidden_states = []
+    # --- Online accumulators for REAP scores (no large tensor storage) ---
+    reap_numer = torch.zeros(num_experts)   # running sum of (norm * gate_val)
+    reap_denom = torch.zeros(num_experts)   # running count of routed tokens
+    expert_frequency = torch.zeros(num_experts)
+    expert_hidden: dict[int, torch.Tensor] = {}
+
+    # --- Capped reservoir for similarity computation ---
+    sim_expert_outputs: list[torch.Tensor] = []
+    sim_gate_logits: list[torch.Tensor] = []
+    sim_tokens_collected = 0
     total_tokens = 0
 
-    # Hook to capture the input to the MoE block and the gate logits
+    # Hook to capture the input to the MoE block
     captured = {}
 
     def capture_moe_input(module, args, output):
         if isinstance(args, tuple) and len(args) > 0:
             captured["moe_input"] = args[0].detach()
-        # Capture gate logits from output
-        if isinstance(output, tuple) and len(output) >= 2:
-            # Most MoE modules return (combined_output, router_logits) or similar
-            for item in output:
-                if isinstance(item, torch.Tensor) and item.dim() == 2:
-                    if item.shape[-1] == num_experts:
-                        captured["gate_logits"] = item.detach()
-                        break
 
     hook = moe.register_forward_hook(capture_moe_input)
 
@@ -166,52 +177,63 @@ def collect_layer_data(
             for i, expert in enumerate(experts):
                 expert_outs[i] = expert(moe_input)
 
-        all_expert_outputs.append(expert_outs.cpu())
-        all_gate_logits.append(gate_probs.cpu())
-        all_hidden_states.append(moe_input.cpu())
+        # Move to CPU once, then free GPU copy
+        expert_outs_cpu = expert_outs.cpu()
+        gate_probs_cpu = gate_probs.cpu()
+        del expert_outs
+
+        # --- Online REAP score computation ---
+        topk_values, topk_indices = torch.topk(gate_probs_cpu, k=topk, dim=-1)
+        for i in range(num_experts):
+            mask = (topk_indices == i).any(dim=-1)
+            if not mask.any():
+                continue
+            count = mask.sum().float()
+            expert_frequency[i] += count
+            expert_state = expert_outs_cpu[i, mask]
+            gate_vals = gate_probs_cpu[mask, i]
+            norms = expert_state.norm(dim=-1)
+            reap_numer[i] += (norms * gate_vals).sum()
+            reap_denom[i] += count
+
+            # Accumulate expert_hidden (capped per expert)
+            if i not in expert_hidden:
+                expert_hidden[i] = expert_state.T[:, :max_hidden_tokens]
+            elif expert_hidden[i].shape[1] < max_hidden_tokens:
+                remaining = max_hidden_tokens - expert_hidden[i].shape[1]
+                expert_hidden[i] = torch.cat(
+                    [expert_hidden[i], expert_state[:remaining].T], dim=1
+                )
+
+        # --- Keep a capped reservoir for similarity matrix ---
+        if sim_tokens_collected < max_sim_tokens:
+            n_keep = min(n_tokens, max_sim_tokens - sim_tokens_collected)
+            sim_expert_outputs.append(expert_outs_cpu[:, :n_keep, :])
+            sim_gate_logits.append(gate_probs_cpu[:n_keep, :])
+            sim_tokens_collected += n_keep
+
+        del expert_outs_cpu, gate_probs_cpu
         total_tokens += n_tokens
 
     hook.remove()
 
-    if not all_expert_outputs:
+    if not sim_expert_outputs:
         raise RuntimeError(
             f"No data collected for layer {layer_idx}. "
             "Check that calibration data flows through the model correctly."
         )
 
-    # Concatenate across batches
-    # expert_outputs: (N, total_tokens, hidden_dim)
-    expert_outputs = torch.cat(all_expert_outputs, dim=1)
-    # gate_logits: (total_tokens, N)
-    gate_logits = torch.cat(all_gate_logits, dim=0)
+    # Finalize REAP scores: mean = sum / count
+    reap_scores = reap_numer / (reap_denom + 1e-8)
 
-    # Compute REAP scores: S_i = mean(||E_i(x)|| * g_i(x)) for tokens routed to expert i
-    topk_values, topk_indices = torch.topk(gate_logits, k=topk, dim=-1)
+    # Concatenate the capped reservoir
+    expert_outputs = torch.cat(sim_expert_outputs, dim=1)
+    gate_logits = torch.cat(sim_gate_logits, dim=0)
 
-    reap_scores = torch.zeros(num_experts)
-    expert_frequency = torch.zeros(num_experts)
-    expert_hidden = {}
-
-    for i in range(num_experts):
-        # Find tokens routed to expert i
-        mask = (topk_indices == i).any(dim=-1)  # (total_tokens,)
-        if not mask.any():
-            continue
-
-        expert_frequency[i] = mask.sum().float()
-        expert_state = expert_outputs[i, mask]  # (selected_tokens, hidden_dim)
-        # Get the gate value for expert i at the selected tokens
-        gate_vals = gate_logits[mask, i]  # (selected_tokens,)
-
-        # REAP score: mean of (norm * gate_value)
-        norms = expert_state.norm(dim=-1)  # (selected_tokens,)
-        reap_scores[i] = (norms * gate_vals).mean()
-
-        # Store hidden activations for permutation alignment
-        # For GLU experts, the hidden is the intermediate after gate_proj
-        # We approximate with the expert output projected through a pseudo-inverse
-        # In practice, we use the expert output norms as a proxy
-        expert_hidden[i] = expert_state.T  # (hidden_dim, selected_tokens)
+    logger.info(
+        f"Layer {layer_idx}: collected REAP scores over {int(total_tokens)} tokens, "
+        f"similarity reservoir {expert_outputs.shape[1]} tokens"
+    )
 
     return {
         "reap_scores": reap_scores,
