@@ -8,6 +8,8 @@ Fork of [CerebrasResearch/reap](https://github.com/CerebrasResearch/reap) implem
 
 REAM compresses Mixture-of-Experts LLMs by **merging** groups of experts rather than pruning them. It reduces the expert count by 25% (e.g., 128 → 96) with strong benchmark retention across Qwen3-30B, Qwen3-235B, and Qwen3-Next-80B.
 
+Qwen3.5 models (35B-A3B, 122B-A10B, 397B-A17B) are supported. Because Qwen3.5 ships as a vision-language model, REAM automatically loads only the text decoder and discards the vision encoder so you don't pay for weights you're not compressing.
+
 Six things make REAM different from prior merging methods like HC-SMoE:
 
 1. **REAP-score centroids** — The k retained experts are chosen by REAP saliency (router-gate-weighted activation norms), not by frequency.
@@ -66,6 +68,7 @@ Modified from REAP:
 | File | Change |
 |---|---|
 | `src/reap/permute.py` | Added `ActivationWeightPermuter` (activation + weight cost matrix) |
+| `src/reap/model_util.py` | Added `Qwen3_5MoeForCausalLM` attrs, `get_layers`, `get_num_experts`, `fused_expert_forward`, `load_model_text_only` |
 | `src/reap/data.py` | Added `NuminaMathLMDataset`, `TheStackSmolLMDataset` processors |
 | `src/reap/args.py` | Added `ream_mixed`, `AI-MO/NuminaMath-1.5`, `bigcode/the-stack-smol` to dataset choices |
 | `pyproject.toml` | Renamed to `ream`, added `scipy` dependency |

@@ -43,7 +43,10 @@ from reap.args import (
     MergeArgs,
 )
 from reap.merge import MergeMethod, MoEExpertMerger
-from reap.model_util import MODEL_ATTRS, patched_model_map, get_moe, assert_merge
+from reap.model_util import (
+    MODEL_ATTRS, patched_model_map, get_moe, assert_merge,
+    get_layers, get_num_experts, fused_expert_forward, load_model_text_only,
+)
 from reap.permute import ActivationWeightPermuter, PERMUTER_REGISTRY
 from reap.ream_cluster import ream_clustering
 from reap.eval import run_evaluate
@@ -87,11 +90,13 @@ def collect_layer_data(
     moe = get_moe(model, layer_idx)
     experts = getattr(moe, model_attrs["experts"])
     router = getattr(moe, model_attrs["router"])
-    num_experts = len(experts)
+    is_fused = model_attrs.get("fused", False)
+    num_experts = get_num_experts(experts, model_attrs)
 
-    # Determine topk from model config
+    # Determine topk from model config (handle nested text_config for VL models)
     topk_key = model_attrs.get("num_experts_per_tok", "num_experts_per_tok")
-    topk = getattr(model.config, topk_key, 8)
+    cfg = getattr(model.config, "text_config", model.config)
+    topk = getattr(cfg, topk_key, 8)
 
     all_expert_outputs = []
     all_gate_logits = []
@@ -151,8 +156,12 @@ def collect_layer_data(
             num_experts, n_tokens, moe_input.shape[-1],
             device=device, dtype=moe_input.dtype
         )
-        for i, expert in enumerate(experts):
-            expert_outs[i] = expert(moe_input)
+        if is_fused:
+            for i in range(num_experts):
+                expert_outs[i] = fused_expert_forward(experts, i, moe_input)
+        else:
+            for i, expert in enumerate(experts):
+                expert_outs[i] = expert(moe_input)
 
         all_expert_outputs.append(expert_outs.cpu())
         all_gate_logits.append(gate_probs.cpu())
@@ -325,7 +334,11 @@ def ream_merge_layer(
     moe = get_moe(model, layer_idx)
 
     # Step 2 & 3: Merge with permutation alignment
-    permute_method = "activation_weight" if use_activation_weight_permute else "wm"
+    is_fused = model_attrs.get("fused", False)
+    if is_fused and use_activation_weight_permute:
+        # ActivationWeightPermuter doesn't support fused experts; fall back to wm
+        logger.info("Fused experts detected — using weight-matching permuter instead of activation+weight")
+    permute_method = "activation_weight" if (use_activation_weight_permute and not is_fused) else "wm"
 
     # For activation_weight permuter, we need to pass hidden activations
     if permute_method == "activation_weight":
@@ -433,12 +446,13 @@ def ream_sequential_merge(
     device = next(model.parameters()).device
 
     # Determine number of MoE layers
-    num_layers = len(model.model.layers)
+    layers = get_layers(model)
+    num_layers = len(layers)
     # Find which layers are MoE layers
     moe_layer_indices = []
     for i in range(num_layers):
         moe_attr = model_attrs.get("moe_block", "mlp")
-        layer_module = model.model.layers[i]
+        layer_module = layers[i]
         if hasattr(layer_module, moe_attr):
             moe = getattr(layer_module, moe_attr)
             if hasattr(moe, "experts"):
@@ -642,7 +656,7 @@ def main():
     # Load model
     model_name = patched_model_map(model_args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = load_model_text_only(
         model_name,
         device_map="auto",
         torch_dtype="auto",
@@ -682,7 +696,8 @@ def main():
             calibration_inputs.extend(cat_data)
 
     # Compute num_clusters
-    num_experts_sample = len(getattr(get_moe(model, 0), model_attrs["experts"]))
+    experts_sample = getattr(get_moe(model, 0), model_attrs["experts"])
+    num_experts_sample = get_num_experts(experts_sample, model_attrs)
     num_clusters = cluster_args.num_clusters
     if num_clusters is None:
         if cluster_args.compression_ratio is None:

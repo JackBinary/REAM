@@ -115,12 +115,63 @@ MODEL_ATTRS = {
         "num_experts": "n_routed_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
+    "Qwen3_5MoeForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "gate",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
 }
+
+
+def get_layers(model):
+    """Return the decoder layer list, handling both standard and VL wrapper paths."""
+    # Standard CausalLM: model.model.layers
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model.layers
+    # Multimodal wrapper: model.model.language_model.layers
+    if hasattr(model, "model") and hasattr(model.model, "language_model"):
+        return model.model.language_model.layers
+    raise AttributeError(
+        f"Cannot find decoder layers on {model.__class__.__name__}. "
+        "Expected model.model.layers or model.model.language_model.layers."
+    )
 
 
 def get_moe(model, layer):
     moe_attr_name = MODEL_ATTRS.get(model.__class__.__name__)["moe_block"]
-    return getattr(model.model.layers[layer], moe_attr_name)
+    return getattr(get_layers(model)[layer], moe_attr_name)
+
+
+def get_num_experts(experts, model_attrs):
+    """Return the number of experts, handling both ModuleList and fused 3D-tensor formats."""
+    if model_attrs.get("fused", False):
+        # Fused experts store weights as (num_experts, ...) Parameter tensors
+        down_proj = getattr(experts, model_attrs["down_proj"])
+        return down_proj.shape[0]
+    return len(experts)
+
+
+def fused_expert_forward(experts, expert_idx, hidden_states):
+    """
+    Manually compute one expert's output for fused 3D-tensor expert modules.
+
+    Fused experts store gate+up as a single (num_experts, 2*intermediate, hidden)
+    Parameter and down as (num_experts, hidden, intermediate).  This function
+    replicates the SiLU-gated MLP forward pass for a single expert.
+    """
+    gate_up_w = experts.gate_up_proj[expert_idx]   # (2*intermediate, hidden)
+    down_w = experts.down_proj[expert_idx]          # (hidden, intermediate)
+
+    gate_up = F.linear(hidden_states, gate_up_w)    # (tokens, 2*intermediate)
+    gate, up = gate_up.chunk(2, dim=-1)
+    hidden = F.silu(gate) * up
+    return F.linear(hidden, down_w)
 
 
 def assert_merge(model, merged_moe, cluster_label):
@@ -163,6 +214,41 @@ def assert_merge(model, merged_moe, cluster_label):
                     getattr(merged_moe.experts[dom_expert], gate_proj).weight
                     == getattr(merged_moe.experts[expert], gate_proj).weight
                 ).all(), f"Experts {expert_indices} are not merged correctly."
+
+
+def is_qwen35(model_name: str) -> bool:
+    """Check if a model name looks like a Qwen3.5 model."""
+    return "qwen3.5" in model_name.lower() or "qwen3_5" in model_name.lower()
+
+
+def load_model_text_only(model_name: str, **kwargs):
+    """
+    Load a model for causal LM, stripping multimodal components for Qwen3.5.
+
+    For Qwen3.5 models, this loads only the text decoder (Qwen3_5MoeForCausalLM)
+    from the multimodal checkpoint, discarding vision encoder weights entirely.
+    For all other models, falls through to AutoModelForCausalLM.
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    if is_qwen35(model_name):
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        # Extract the text config from the multimodal wrapper
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            logger.info(
+                f"Qwen3.5 detected — loading text-only decoder from {model_name} "
+                f"(dropping vision encoder)"
+            )
+            from transformers import Qwen3_5MoeForCausalLM
+            model = Qwen3_5MoeForCausalLM.from_pretrained(
+                model_name, config=text_config, **kwargs
+            )
+            return model
+        # If there's no text_config, it might already be a text-only checkpoint
+        logger.info(f"Qwen3.5 text-only config detected for {model_name}")
+
+    return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
 
 
 def patched_model_map(model: str):
