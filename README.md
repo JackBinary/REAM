@@ -1,3 +1,7 @@
+# ⚠️ Vibe-coded warning
+
+This fork is vibe-coded to hell. I don't know what anything truly is, it's not recommended for use until I test it more, and it only exists because I couldn't be patient and wait for Samsung to release their official REAM code
+
 # REAM: Router-weighted Expert Activation Merging
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/JackBinary/REAM/blob/main/ream_colab.ipynb)
@@ -190,7 +194,7 @@ Please consider using the following citations if you found this work useful:
     url         = {https://bknyaz.github.io/blog/2026/moe/},
 }
 ```
-```
+````
 @misc{lasby-reap,
     title       = {{REAP the Experts: Why Pruning Prevails for One-Shot MoE compression}},
     author      = {Lasby, Mike and Lazarevich, Ivan and Sinnadurai, Nish and Lie, Sean and Ioannou, Yani and Thangarasa, Vithursan},
