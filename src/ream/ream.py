@@ -149,6 +149,9 @@ def collect_layer_data(
         # Compute gate logits manually
         with torch.no_grad():
             gate_out = router(moe_input)  # (n_tokens, N)
+            # Some routers (e.g. Qwen3.5) return a tuple (logits, scores, indices)
+            if isinstance(gate_out, tuple):
+                gate_out = gate_out[0]
             gate_probs = F.softmax(gate_out, dim=-1)
 
         # Compute expert outputs for all experts

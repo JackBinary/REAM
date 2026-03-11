@@ -355,6 +355,9 @@ class MoETransformerObserver(BaseTransformerObserver):
             if self.hook_config.fused_experts:
                 _, router_scores = output  # (num_experts, total_tokens)
                 router_logits = module.router(flat_input)  # (total_tokens, num_experts)
+                # Some routers (e.g. Qwen3.5) return a tuple (logits, scores, indices)
+                if isinstance(router_logits, tuple):
+                    router_logits = router_logits[0]
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
                 selected_experts = selected_experts.to(device)
                 router_indices = (
