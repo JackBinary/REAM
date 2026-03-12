@@ -174,6 +174,45 @@ class WeightMatchingPermuter(ExpertPermuter):
         gate_proj.weight.data = gate_proj.weight[permutation]
         down_proj.weight.data = down_proj.weight[:, permutation]
 
+    @staticmethod
+    def _detect_fused_layout(gate_up_proj, down_proj):
+        """
+        Detect the fused gate_up_proj layout by matching dimensions against down_proj.
+
+        Fused experts concatenate gate and up projections (equal size) into one tensor.
+        The intermediate dimension (d_inter) appears as 2*d_inter in gate_up_proj.
+
+        Returns:
+            (d_inter, split_axis, perm_axis_gate_up, perm_axis_down)
+            split_axis: which dim of gate_up_proj[expert] holds 2*d_inter (0 or 1)
+            perm_axis_gate_up: the axis to permute in gate_up_proj[expert]
+            perm_axis_down: the axis to permute in down_proj[expert]
+        """
+        # gate_up_proj: (N, A, B)  down_proj: (N, C, D)
+        # One of {A, B} equals 2*d_inter, one of {C, D} equals d_inter
+        A, B = gate_up_proj.shape[1], gate_up_proj.shape[2]
+        C, D = down_proj.shape[1], down_proj.shape[2]
+
+        # Llama4 layout: gate_up = (N, d_model, 2*d_inter), down = (N, d_inter, d_model)
+        #   → B == 2*C, split last dim (axis=1 of 2D slice), perm cols of gate_up, perm rows of down
+        if B == 2 * C:
+            return C, 1, 1, 0
+        # Transposed layout (Qwen3.5): gate_up = (N, 2*d_inter, d_model), down = (N, d_model, d_inter)
+        #   → A == 2*D, split first dim (axis=0 of 2D slice), perm rows of gate_up, perm cols of down
+        if A == 2 * D:
+            return D, 0, 0, 1
+        # Try remaining combos
+        if B == 2 * D:
+            return D, 1, 1, 1
+        if A == 2 * C:
+            return C, 0, 0, 0
+
+        raise ValueError(
+            f"Cannot detect fused layout: gate_up_proj per-expert shape ({A}, {B}), "
+            f"down_proj per-expert shape ({C}, {D}). Expected one dim to be 2x the "
+            f"intermediate size found in down_proj."
+        )
+
     def _fused_permute(
         self,
         experts: nn.Module,
@@ -181,8 +220,13 @@ class WeightMatchingPermuter(ExpertPermuter):
         dom_expert_idx: int,
     ):
         """Permutes experts in a fused model using weight matching.
-        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, 2 * self.expert_dim))
-        self.down_proj = nn.Parameter(torch.empty((self.num_experts, self.expert_dim, self.hidden_size)))
+
+        Handles both Llama4-style layout:
+            gate_up_proj = (num_experts, hidden_size, 2 * expert_dim)
+            down_proj    = (num_experts, expert_dim, hidden_size)
+        and Qwen3.5-style (transposed) layout:
+            gate_up_proj = (num_experts, 2 * expert_dim, hidden_size)
+            down_proj    = (num_experts, hidden_size, expert_dim)
         """
         if len(expert_indices) == 1:
             return  # No permutation needed if only one expert
@@ -194,38 +238,71 @@ class WeightMatchingPermuter(ExpertPermuter):
         up_gate_proj = up_gate_proj_param.data.cpu()
         down_proj = down_proj_param.data.cpu()
 
-        expert_dim = down_proj.shape[1]
+        d_inter, split_axis, perm_axis_gu, perm_axis_down = self._detect_fused_layout(
+            up_gate_proj, down_proj
+        )
+        logger.debug(
+            f"Fused layout: d_inter={d_inter}, split_axis={split_axis}, "
+            f"gate_up perm axis={perm_axis_gu}, down perm axis={perm_axis_down}"
+        )
 
-        dom_gate = up_gate_proj[dom_expert_idx, :, :expert_dim]
-        dom_up = up_gate_proj[dom_expert_idx, :, expert_dim:]
+        def _split_gate_up(tensor_2d):
+            """Split a single expert's gate_up tensor into gate and up halves."""
+            if split_axis == 1:
+                return tensor_2d[:, :d_inter], tensor_2d[:, d_inter:]
+            else:
+                return tensor_2d[:d_inter, :], tensor_2d[d_inter:, :]
+
+        def _get_cost_vectors(gate, up, down):
+            """Get per-neuron vectors for cost matrix computation.
+            Returns tensors of shape (d_inter, features) suitable for cdist."""
+            if perm_axis_gu == 1:
+                # Permuting columns of gate_up → each neuron is a column → transpose
+                g_vecs, u_vecs = gate.T, up.T
+            else:
+                # Permuting rows of gate_up → each neuron is a row → use directly
+                g_vecs, u_vecs = gate, up
+            if perm_axis_down == 0:
+                d_vecs = down
+            else:
+                d_vecs = down.T
+            return g_vecs, u_vecs, d_vecs
+
+        dom_gate, dom_up = _split_gate_up(up_gate_proj[dom_expert_idx])
         dom_down = down_proj[dom_expert_idx]
+        dom_g, dom_u, dom_d = _get_cost_vectors(dom_gate, dom_up, dom_down)
 
         for expert_idx in expert_indices:
             if expert_idx == dom_expert_idx:
                 continue
-            this_gate_proj = up_gate_proj[expert_idx, :, :expert_dim]
-            this_up_proj = up_gate_proj[expert_idx, :, expert_dim:]
-            this_down_proj = down_proj[expert_idx]
+            this_gate, this_up = _split_gate_up(up_gate_proj[expert_idx])
+            this_down = down_proj[expert_idx]
+            this_g, this_u, this_d = _get_cost_vectors(this_gate, this_up, this_down)
 
-            up_cost = _weight_match_dist(
-                this_up_proj.T,
-                dom_up.T,
-            )
-            gate_cost = _weight_match_dist(
-                this_gate_proj.T,
-                dom_gate.T,
-            )
-            down_cost = _weight_match_dist(this_down_proj, dom_down)
+            gate_cost = _weight_match_dist(this_g, dom_g)
+            up_cost = _weight_match_dist(this_u, dom_u)
+            down_cost = _weight_match_dist(this_d, dom_d)
             cost_matrix = up_cost + gate_cost + down_cost
             del up_cost, gate_cost, down_cost
             cost_matrix_np = cost_matrix.to(torch.float16).numpy()
             row_ind, col_ind = linear_sum_assignment(cost_matrix_np)
             permutation = torch.tensor(col_ind, dtype=torch.long).argsort()
 
-            up_gate_proj[expert_idx, :, :expert_dim] = this_gate_proj[:, permutation]
-            up_gate_proj[expert_idx, :, expert_dim:] = this_up_proj[:, permutation]
-            down_proj[expert_idx, :] = this_down_proj[permutation, :]
-            del this_down_proj, this_gate_proj, this_up_proj
+            # Apply permutation to gate_up_proj
+            if split_axis == 1:
+                up_gate_proj[expert_idx, :, :d_inter] = this_gate[:, permutation]
+                up_gate_proj[expert_idx, :, d_inter:] = this_up[:, permutation]
+            else:
+                up_gate_proj[expert_idx, :d_inter, :] = this_gate[permutation, :]
+                up_gate_proj[expert_idx, d_inter:, :] = this_up[permutation, :]
+
+            # Apply permutation to down_proj
+            if perm_axis_down == 0:
+                down_proj[expert_idx] = this_down[permutation, :]
+            else:
+                down_proj[expert_idx] = this_down[:, permutation]
+
+            del this_down, this_gate, this_up
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -250,10 +327,14 @@ class WeightMatchingPermuter(ExpertPermuter):
         del input
         del orig_out
         del permuted_out
-        
+
+        gu_attr = self.model_attrs["up_proj"]
+        dp_attr = self.model_attrs["down_proj"]
         if torch.allclose(
-            orig_experts.gate_up_proj.cpu(), experts.gate_up_proj.cpu()
-        ) or torch.allclose(orig_experts.down_proj.cpu(), experts.down_proj.cpu()):
+            getattr(orig_experts, gu_attr).cpu(), getattr(experts, gu_attr).cpu()
+        ) or torch.allclose(
+            getattr(orig_experts, dp_attr).cpu(), getattr(experts, dp_attr).cpu()
+        ):
             logger.warning(
                 "Permuted experts' weights should not be equal to the original experts'"
                 " weights."
