@@ -5,6 +5,7 @@ import gc
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 import numpy as np
 from sklearn.decomposition import PCA
 from scipy.optimize import linear_sum_assignment
@@ -310,24 +311,48 @@ class WeightMatchingPermuter(ExpertPermuter):
         down_proj_param.data = down_proj.to(device)
 
         # Check permutation invariance and weights changed
-        # Use fused_expert_forward for fused experts (they require top_k_index/top_k_weights)
-        from ream.model_util import fused_expert_forward
+        # Compute forward pass manually using detected layout (fused experts need top_k args)
+        # Determine input dimension from layout:
+        #   Llama4: gate_up = (N, d_model, 2*d_inter) -> input dim = d_model = shape[1]
+        #   Qwen3.5: gate_up = (N, 2*d_inter, d_model) -> input dim = d_model = shape[2]
+        if split_axis == 1:  # Llama4 layout
+            input_dim = up_gate_proj.shape[1]
+        else:  # Qwen3.5 layout
+            input_dim = up_gate_proj.shape[2]
+
         input = torch.rand(
-            (1, up_gate_proj.shape[1]),
+            (1, input_dim),
             dtype=up_gate_proj.dtype,
             device=device,
         )
+
+        def _fused_forward(gate_up_w, down_w, hidden):
+            """Manual forward for fused expert with layout-aware handling."""
+            if split_axis == 1:  # Llama4: gate_up = (d_model, 2*d_inter)
+                gate_up = F.linear(hidden, gate_up_w.T)  # (1, 2*d_inter)
+                gate, up = gate_up.chunk(2, dim=-1)
+                hidden = F.silu(gate) * up
+                return F.linear(hidden, down_w.T)  # down = (d_inter, d_model)
+            else:  # Qwen3.5: gate_up = (2*d_inter, d_model)
+                gate_up = F.linear(hidden, gate_up_w)  # (1, 2*d_inter)
+                gate, up = gate_up.chunk(2, dim=-1)
+                hidden = F.silu(gate) * up
+                return F.linear(hidden, down_w)  # down = (d_model, d_inter)
+
         # Check each expert individually
+        orig_experts_dev = orig_experts.to(device)
+        orig_gate_up = getattr(orig_experts_dev, self.model_attrs["up_proj"])
+        orig_down = getattr(orig_experts_dev, self.model_attrs["down_proj"])
         for expert_idx in expert_indices:
-            orig_out = fused_expert_forward(orig_experts.to(device), expert_idx, input)
-            permuted_out = fused_expert_forward(experts, expert_idx, input)
+            orig_out = _fused_forward(orig_gate_up[expert_idx], orig_down[expert_idx], input)
+            permuted_out = _fused_forward(up_gate_proj_param[expert_idx], down_proj_param[expert_idx], input)
             if not torch.allclose(orig_out, permuted_out, atol=1e-2):
                 logger.warning(
                     f"Output of permuted expert {expert_idx} should match original. "
                     f"Sum(abs(out1 - out2)) = {torch.sum(torch.abs(orig_out - permuted_out))}"
                 )
             del orig_out, permuted_out
-        del input
+        del input, orig_experts_dev
 
         gu_attr = self.model_attrs["up_proj"]
         dp_attr = self.model_attrs["down_proj"]
