@@ -55,6 +55,73 @@ from ream.model_util import (
 from ream.permute import ActivationWeightPermuter, PERMUTER_REGISTRY
 from ream.ream_cluster import ream_clustering
 from ream.eval import run_evaluate
+
+# Module-level worker function for multiprocessing (must be at module level for pickling)
+def _collect_layer_data_worker(
+    gpu_id: int,
+    calib_chunk: list,
+    model_name: str,
+    model_state: dict,
+    layer_idx: int,
+    model_attrs: dict,
+    max_sim_tokens: int,
+    max_hidden_tokens: int,
+    num_gpus: int,
+    result_queue,
+):
+    """Worker function for multi-GPU layer data collection. Must be at module level for pickling."""
+    import torch
+    from ream.model_util import load_model_text_only
+    
+    logger = logging.getLogger(__name__)
+    try:
+        torch.cuda.set_device(gpu_id)
+        device = torch.device(f"cuda:{gpu_id}")
+        
+        # Load a fresh copy of the model on this GPU
+        local_model = load_model_text_only(
+            model_name,
+            device_map={"": device},
+            torch_dtype="auto",
+            trust_remote_code=True,
+        )
+        
+        # Load the (possibly merged) state
+        local_model.load_state_dict(model_state)
+        local_model.eval()
+        
+        # Collect data - need to call the single-GPU version
+        # We pass the function reference to avoid circular import issues
+        result = collect_layer_data_single_gpu(
+            model=local_model,
+            calibration_inputs=calib_chunk,
+            layer_idx=layer_idx,
+            model_attrs=model_attrs,
+            device=device,
+            max_sim_tokens=max_sim_tokens // num_gpus,  # Split quota across GPUs
+            max_hidden_tokens=max_hidden_tokens,
+        )
+        
+        # Move all tensors to CPU to avoid multiprocessing sharing issues
+        result_cpu = {
+            "reap_scores": result["reap_scores"].cpu(),
+            "expert_outputs": result["expert_outputs"].cpu(),
+            "gate_logits": result["gate_logits"].cpu(),
+            "expert_hidden": {k: v.cpu() for k, v in result["expert_hidden"].items()},
+            "expert_frequency": result["expert_frequency"].cpu(),
+            "total_tokens": result["total_tokens"],
+        }
+        
+        result_queue.put((gpu_id, result_cpu))
+        
+        # Clean up
+        del local_model
+        del result
+        torch.cuda.empty_cache()
+        
+    except Exception as e:
+        logger.error(f"GPU {gpu_id} failed: {e}")
+        result_queue.put((gpu_id, None))
 from ream.main import (
     parse_args,
     create_results_directory,
@@ -599,58 +666,7 @@ def collect_layer_data(
     # Prepare model state dict for replication
     model_state = model.state_dict()
     
-    # Worker function for each GPU
-    def worker_fn(gpu_id: int, calib_chunk: list, result_queue: mp.Queue):
-        try:
-            torch.cuda.set_device(gpu_id)
-            device = torch.device(f"cuda:{gpu_id}")
-            
-            # Load a fresh copy of the model on this GPU
-            local_model = load_model_text_only(
-                model_name,
-                device_map={"": device},
-                torch_dtype="auto",
-                trust_remote_code=True,
-            )
-            
-            # Load the (possibly merged) state
-            local_model.load_state_dict(model_state)
-            local_model.eval()
-            
-            # Collect data
-            result = collect_layer_data_single_gpu(
-                model=local_model,
-                calibration_inputs=calib_chunk,
-                layer_idx=layer_idx,
-                model_attrs=model_attrs,
-                device=device,
-                max_sim_tokens=max_sim_tokens // num_gpus,  # Split quota across GPUs
-                max_hidden_tokens=max_hidden_tokens,
-            )
-            
-            # Move all tensors to CPU to avoid multiprocessing sharing issues
-            result_cpu = {
-                "reap_scores": result["reap_scores"].cpu(),
-                "expert_outputs": result["expert_outputs"].cpu(),
-                "gate_logits": result["gate_logits"].cpu(),
-                "expert_hidden": {k: v.cpu() for k, v in result["expert_hidden"].items()},
-                "expert_frequency": result["expert_frequency"].cpu(),
-                "total_tokens": result["total_tokens"],
-            }
-            
-            result_queue.put((gpu_id, result_cpu))
-            
-            # Clean up
-            del local_model
-            del result
-            torch.cuda.empty_cache()
-            
-        except Exception as e:
-            logger.error(f"GPU {gpu_id} failed: {e}")
-            result_queue.put((gpu_id, None))
-    
-    # Launch workers
-    mp.set_start_method('spawn', force=True)
+    # Launch workers using module-level function (required for pickling with spawn)
     result_queue = mp.Queue()
     processes = []
     
@@ -658,8 +674,9 @@ def collect_layer_data(
         if not chunk:
             continue
         p = mp.Process(
-            target=worker_fn,
-            args=(gpu_id, chunk, result_queue)
+            target=_collect_layer_data_worker,
+            args=(gpu_id, chunk, model_name, model_state, layer_idx, 
+                  model_attrs, max_sim_tokens, max_hidden_tokens, num_gpus, result_queue)
         )
         p.start()
         processes.append(p)
