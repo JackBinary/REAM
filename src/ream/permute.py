@@ -310,23 +310,24 @@ class WeightMatchingPermuter(ExpertPermuter):
         down_proj_param.data = down_proj.to(device)
 
         # Check permutation invariance and weights changed
+        # Use fused_expert_forward for fused experts (they require top_k_index/top_k_weights)
+        from ream.model_util import fused_expert_forward
         input = torch.rand(
-            (up_gate_proj.shape[0], up_gate_proj.shape[1]),
+            (1, up_gate_proj.shape[1]),
             dtype=up_gate_proj.dtype,
             device=device,
         )
-        orig_out = orig_experts.to(device)(input)
-        permuted_out = experts(input)
-        if not torch.allclose(orig_out, permuted_out, atol=1e-2):
-            logger.warning(
-                "Output of permuted experts should match original expert. "
-                "Sum(abs(out1 - out2)) = {}".format(
-                    torch.sum(torch.abs(orig_out - permuted_out))
+        # Check each expert individually
+        for expert_idx in expert_indices:
+            orig_out = fused_expert_forward(orig_experts.to(device), expert_idx, input)
+            permuted_out = fused_expert_forward(experts, expert_idx, input)
+            if not torch.allclose(orig_out, permuted_out, atol=1e-2):
+                logger.warning(
+                    f"Output of permuted expert {expert_idx} should match original. "
+                    f"Sum(abs(out1 - out2)) = {torch.sum(torch.abs(orig_out - permuted_out))}"
                 )
-            )
+            del orig_out, permuted_out
         del input
-        del orig_out
-        del permuted_out
 
         gu_attr = self.model_attrs["up_proj"]
         dp_attr = self.model_attrs["down_proj"]
