@@ -11,6 +11,7 @@ Key differences from REAP's existing merging pipeline:
   4. Sequential layer processing (recompute activations after each merge)
   5. Gate weight pruning (remove non-centroid expert rows from router)
   6. Mixed calibration data (c4 + math + coding)
+  7. Checkpointing and interrupt handling for cost-effective execution
 """
 
 from __future__ import annotations
@@ -20,7 +21,11 @@ import logging
 import dataclasses
 import pathlib
 import gc
+import signal
+import sys
+import json
 from typing import Any, Optional
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -62,6 +67,237 @@ from ream.main import (
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+# ---------------------------------------------------------------------------
+# Global interrupt handling
+# ---------------------------------------------------------------------------
+
+class InterruptHandler:
+    """
+    Graceful interrupt handler for SIGTERM and SIGINT.
+    
+    Allows the current layer merge to complete before saving checkpoint and exiting.
+    This enables use of cheaper interruptible instances (2/3 the price).
+    """
+    def __init__(self):
+        self.interrupted = False
+        self.original_sigterm = None
+        self.original_sigint = None
+        
+    def __enter__(self):
+        self.original_sigterm = signal.signal(signal.SIGTERM, self._handler)
+        self.original_sigint = signal.signal(signal.SIGINT, self._handler)
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        signal.signal(signal.SIGTERM, self.original_sigterm)
+        signal.signal(signal.SIGINT, self.original_sigint)
+        return False
+    
+    def _handler(self, signum, frame):
+        if self.interrupted:
+            logger.warning("Received second interrupt signal, forcing exit...")
+            sys.exit(1)
+        logger.warning(f"Received interrupt signal {signum}, will checkpoint after current layer...")
+        self.interrupted = True
+
+
+# Global handler instance
+_interrupt_handler: Optional[InterruptHandler] = None
+
+
+def get_interrupt_handler() -> Optional[InterruptHandler]:
+    """Get the global interrupt handler."""
+    return _interrupt_handler
+
+
+def set_interrupt_handler(handler: Optional[InterruptHandler]):
+    """Set the global interrupt handler."""
+    global _interrupt_handler
+    _interrupt_handler = handler
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint management
+# ---------------------------------------------------------------------------
+
+CHECKPOINT_VERSION = 1
+
+
+def save_checkpoint(
+    checkpoint_dir: pathlib.Path,
+    model: nn.Module,
+    layer_idx: int,
+    layers_to_process: list[int],
+    all_cluster_labels: dict[int, torch.Tensor],
+    all_centroid_indices: dict[int, list[int]],
+    calibration_inputs: list[torch.Tensor],
+    num_clusters: int,
+    max_cluster_size: int,
+    merge_method: str,
+    use_activation_weight_permute: bool,
+    prune_gate: bool,
+    skip_first: bool,
+    skip_last: bool,
+    seed: int,
+    model_name: str,
+    results_dir: pathlib.Path,
+):
+    """
+    Save a checkpoint of the current merging state.
+    
+    Saves:
+      - Model state dict (merged layers so far)
+      - Layer processing progress
+      - Clustering results
+      - Calibration data (tokenized)
+      - All configuration parameters
+    
+    Args:
+        checkpoint_dir: Directory to save checkpoint
+        model: Current model state
+        layer_idx: Current layer being processed
+        layers_to_process: List of all layers to process
+        all_cluster_labels: Cluster labels for processed layers
+        all_centroid_indices: Centroid indices for processed layers
+        calibration_inputs: Tokenized calibration data
+        ... other config parameters
+    """
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save model state
+    model_path = checkpoint_dir / "model_state.pt"
+    torch.save(model.state_dict(), model_path)
+    
+    # Save calibration data (tokenized inputs)
+    calib_path = checkpoint_dir / "calibration_data.pt"
+    torch.save(calibration_inputs, calib_path)
+    
+    # Save cluster labels and centroids
+    clusters_path = checkpoint_dir / "clusters.pt"
+    torch.save({
+        "all_cluster_labels": all_cluster_labels,
+        "all_centroid_indices": all_centroid_indices,
+    }, clusters_path)
+    
+    # Save metadata
+    metadata = {
+        "version": CHECKPOINT_VERSION,
+        "timestamp": datetime.now().isoformat(),
+        "layer_idx": layer_idx,
+        "layers_to_process": layers_to_process,
+        "num_clusters": num_clusters,
+        "max_cluster_size": max_cluster_size,
+        "merge_method": merge_method,
+        "use_activation_weight_permute": use_activation_weight_permute,
+        "prune_gate": prune_gate,
+        "skip_first": skip_first,
+        "skip_last": skip_last,
+        "seed": seed,
+        "model_name": model_name,
+        "results_dir": str(results_dir),
+    }
+    
+    metadata_path = checkpoint_dir / "checkpoint_metadata.json"
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    logger.info(f"Checkpoint saved to {checkpoint_dir}")
+    logger.info(f"  Processed {len(all_cluster_labels)} layers, "
+                f"next layer: {layer_idx if layer_idx in layers_to_process else 'done'}")
+
+
+def load_checkpoint(
+    checkpoint_dir: pathlib.Path,
+    model: nn.Module,
+    device: torch.device,
+) -> dict:
+    """
+    Load a checkpoint and restore state.
+    
+    Args:
+        checkpoint_dir: Directory containing checkpoint
+        model: Model to restore state into
+        device: Device to load tensors to
+        
+    Returns:
+        Dict with all checkpoint metadata and data
+    """
+    # Load metadata
+    metadata_path = checkpoint_dir / "checkpoint_metadata.json"
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+    
+    if metadata["version"] != CHECKPOINT_VERSION:
+        raise ValueError(
+            f"Checkpoint version mismatch: {metadata['version']} != {CHECKPOINT_VERSION}"
+        )
+    
+    # Load model state
+    model_path = checkpoint_dir / "model_state.pt"
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+    
+    # Load calibration data
+    calib_path = checkpoint_dir / "calibration_data.pt"
+    calibration_inputs = torch.load(calib_path, map_location="cpu")
+    
+    # Load cluster data
+    clusters_path = checkpoint_dir / "clusters.pt"
+    clusters_data = torch.load(clusters_path, map_location="cpu")
+    
+    logger.info(f"Checkpoint loaded from {checkpoint_dir}")
+    logger.info(f"  Timestamp: {metadata['timestamp']}")
+    logger.info(f"  Already processed {len(clusters_data['all_cluster_labels'])} layers")
+    
+    return {
+        **metadata,
+        "calibration_inputs": calibration_inputs,
+        "all_cluster_labels": clusters_data["all_cluster_labels"],
+        "all_centroid_indices": clusters_data["all_centroid_indices"],
+    }
+
+
+def find_latest_checkpoint(checkpoint_base_dir: pathlib.Path) -> Optional[pathlib.Path]:
+    """
+    Find the most recent checkpoint directory.
+    
+    Checkpoints are named: checkpoint_YYYYMMDD_HHMMSS
+    
+    Args:
+        checkpoint_base_dir: Base directory for checkpoints
+        
+    Returns:
+        Path to latest checkpoint, or None if none exist
+    """
+    if not checkpoint_base_dir.exists():
+        return None
+    
+    checkpoint_dirs = sorted(
+        [d for d in checkpoint_base_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint_")],
+        key=lambda x: x.name,
+        reverse=True
+    )
+    
+    if not checkpoint_dirs:
+        return None
+    
+    # Verify it's a valid checkpoint
+    latest = checkpoint_dirs[0]
+    if not (latest / "checkpoint_metadata.json").exists():
+        logger.warning(f"Found checkpoint dir {latest} but missing metadata, skipping")
+        return find_latest_checkpoint_in_list(checkpoint_dirs[1:])
+    
+    return latest
+
+
+def find_latest_checkpoint_in_list(checkpoint_dirs: list[pathlib.Path]) -> Optional[pathlib.Path]:
+    """Helper to find valid checkpoint in a sorted list."""
+    for d in checkpoint_dirs:
+        if (d / "checkpoint_metadata.json").exists():
+            return d
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -443,14 +679,24 @@ def ream_sequential_merge(
     prune_gate: bool = True,
     skip_first: bool = False,
     skip_last: bool = False,
+    checkpoint_dir: Optional[pathlib.Path] = None,
+    checkpoint_interval: int = 1,
+    seed: int = 42,
+    model_name: str = "",
+    results_dir: Optional[pathlib.Path] = None,
+    resume_from_checkpoint: Optional[pathlib.Path] = None,
 ) -> dict:
     """
-    Run the full REAM sequential merging pipeline.
+    Run the full REAM sequential merging pipeline with checkpointing support.
 
     The key insight: after merging layer L, we recompute the activations
     for layer L+1 using the *merged* model. This means each subsequent layer
     sees updated inputs, producing better merging decisions than computing
     all activations from the original model upfront.
+
+    Supports graceful interruption via SIGTERM/SIGINT. When interrupted,
+    completes the current layer merge, saves a checkpoint, and exits.
+    The process can be resumed from the checkpoint later.
 
     Args:
         model: The MoE model to compress
@@ -463,6 +709,12 @@ def ream_sequential_merge(
         prune_gate: Prune gate weights after each layer merge
         skip_first: Skip merging the first MoE layer
         skip_last: Skip merging the last MoE layer
+        checkpoint_dir: Directory to save checkpoints (if None, no checkpointing)
+        checkpoint_interval: Save checkpoint every N layers (default: 1)
+        seed: Random seed for reproducibility
+        model_name: Model name for checkpoint metadata
+        results_dir: Results directory for checkpoint metadata
+        resume_from_checkpoint: Path to checkpoint to resume from
 
     Returns:
         Dict with cluster_labels and centroid_indices per layer
@@ -502,40 +754,150 @@ def ream_sequential_merge(
         logger.info(f"Skipping last MoE layer {layers_to_process[-1]}")
         layers_to_process = layers_to_process[:-1]
 
-    for layer_idx in tqdm(layers_to_process, desc="REAM sequential merge"):
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Processing MoE layer {layer_idx}")
-        logger.info(f"{'='*60}")
+    # Resume from checkpoint if specified
+    start_layer_idx = 0
+    if resume_from_checkpoint is not None:
+        logger.info(f"Resuming from checkpoint: {resume_from_checkpoint}")
+        checkpoint_data = load_checkpoint(resume_from_checkpoint, model, device)
+        
+        # Restore state
+        all_cluster_labels = checkpoint_data["all_cluster_labels"]
+        all_centroid_indices = checkpoint_data["all_centroid_indices"]
+        calibration_inputs = checkpoint_data["calibration_inputs"]
+        
+        # Find where to resume
+        processed_layers = set(all_cluster_labels.keys())
+        remaining_layers = [l for l in layers_to_process if l not in processed_layers]
+        
+        if not remaining_layers:
+            logger.info("Checkpoint indicates all layers already processed!")
+            return {
+                "cluster_labels": all_cluster_labels,
+                "centroid_indices": all_centroid_indices,
+            }
+        
+        layers_to_process = remaining_layers
+        logger.info(f"Resuming from layer {layers_to_process[0]}, "
+                    f"{len(layers_to_process)} layers remaining")
 
-        # Collect fresh activations through the (possibly already merged) model
-        layer_data = collect_layer_data(
-            model=model,
-            calibration_inputs=calibration_inputs,
-            layer_idx=layer_idx,
-            model_attrs=model_attrs,
-            device=device,
-        )
+    # Set up interrupt handler
+    handler = InterruptHandler()
+    set_interrupt_handler(handler)
+    
+    with handler:
+        for i, layer_idx in enumerate(tqdm(layers_to_process, desc="REAM sequential merge")):
+            # Check for interruption before starting new layer
+            if handler.interrupted:
+                logger.warning("Interrupt requested, saving checkpoint before exit...")
+                if checkpoint_dir is not None:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    ckpt_path = checkpoint_dir / f"checkpoint_{timestamp}"
+                    save_checkpoint(
+                        checkpoint_dir=ckpt_path,
+                        model=model,
+                        layer_idx=layer_idx,
+                        layers_to_process=layers_to_process[i:],
+                        all_cluster_labels=all_cluster_labels,
+                        all_centroid_indices=all_centroid_indices,
+                        calibration_inputs=calibration_inputs,
+                        num_clusters=num_clusters,
+                        max_cluster_size=max_cluster_size,
+                        merge_method=merge_method,
+                        use_activation_weight_permute=use_activation_weight_permute,
+                        prune_gate=prune_gate,
+                        skip_first=skip_first,
+                        skip_last=skip_last,
+                        seed=seed,
+                        model_name=model_name,
+                        results_dir=results_dir or pathlib.Path("."),
+                    )
+                logger.info("Checkpoint saved. Exiting gracefully.")
+                sys.exit(0)
 
-        # Run REAM merge for this layer
-        cluster_labels, centroid_indices = ream_merge_layer(
-            model=model,
-            layer_idx=layer_idx,
-            layer_data=layer_data,
-            num_clusters=num_clusters,
-            max_cluster_size=max_cluster_size,
-            model_attrs=model_attrs,
-            merge_method=merge_method,
-            use_activation_weight_permute=use_activation_weight_permute,
-            prune_gate=prune_gate,
-        )
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Processing MoE layer {layer_idx}")
+            logger.info(f"{'='*60}")
 
-        all_cluster_labels[layer_idx] = cluster_labels
-        all_centroid_indices[layer_idx] = centroid_indices
+            # Collect fresh activations through the (possibly already merged) model
+            layer_data = collect_layer_data(
+                model=model,
+                calibration_inputs=calibration_inputs,
+                layer_idx=layer_idx,
+                model_attrs=model_attrs,
+                device=device,
+            )
 
-        # Free memory
-        del layer_data
-        gc.collect()
-        torch.cuda.empty_cache()
+            # Run REAM merge for this layer
+            cluster_labels, centroid_indices = ream_merge_layer(
+                model=model,
+                layer_idx=layer_idx,
+                layer_data=layer_data,
+                num_clusters=num_clusters,
+                max_cluster_size=max_cluster_size,
+                model_attrs=model_attrs,
+                merge_method=merge_method,
+                use_activation_weight_permute=use_activation_weight_permute,
+                prune_gate=prune_gate,
+            )
+
+            all_cluster_labels[layer_idx] = cluster_labels
+            all_centroid_indices[layer_idx] = centroid_indices
+
+            # Save checkpoint periodically
+            if checkpoint_dir is not None and (i + 1) % checkpoint_interval == 0:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                ckpt_path = checkpoint_dir / f"checkpoint_{timestamp}"
+                save_checkpoint(
+                    checkpoint_dir=ckpt_path,
+                    model=model,
+                    layer_idx=layers_to_process[i + 1] if i + 1 < len(layers_to_process) else -1,
+                    layers_to_process=layers_to_process[i + 1:],
+                    all_cluster_labels=all_cluster_labels,
+                    all_centroid_indices=all_centroid_indices,
+                    calibration_inputs=calibration_inputs,
+                    num_clusters=num_clusters,
+                    max_cluster_size=max_cluster_size,
+                    merge_method=merge_method,
+                    use_activation_weight_permute=use_activation_weight_permute,
+                    prune_gate=prune_gate,
+                    skip_first=skip_first,
+                    skip_last=skip_last,
+                    seed=seed,
+                    model_name=model_name,
+                    results_dir=results_dir or pathlib.Path("."),
+                )
+
+            # Free memory
+            del layer_data
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # Check for interruption after completing all layers
+        if handler.interrupted:
+            logger.warning("Interrupt requested but all layers completed. Saving final checkpoint...")
+            if checkpoint_dir is not None:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                ckpt_path = checkpoint_dir / f"checkpoint_final_{timestamp}"
+                save_checkpoint(
+                    checkpoint_dir=ckpt_path,
+                    model=model,
+                    layer_idx=-1,  # Indicates completion
+                    layers_to_process=[],
+                    all_cluster_labels=all_cluster_labels,
+                    all_centroid_indices=all_centroid_indices,
+                    calibration_inputs=calibration_inputs,
+                    num_clusters=num_clusters,
+                    max_cluster_size=max_cluster_size,
+                    merge_method=merge_method,
+                    use_activation_weight_permute=use_activation_weight_permute,
+                    prune_gate=prune_gate,
+                    skip_first=skip_first,
+                    skip_last=skip_last,
+                    seed=seed,
+                    model_name=model_name,
+                    results_dir=results_dir or pathlib.Path("."),
+                )
+            sys.exit(0)
 
     return {
         "cluster_labels": all_cluster_labels,
@@ -660,9 +1022,12 @@ def main():
     Runs the full pipeline:
       1. Load model and tokenizer
       2. Load mixed calibration data
-      3. Run sequential REAM merging
+      3. Run sequential REAM merging (with checkpointing)
       4. Save compressed model
       5. Optionally evaluate
+
+    Supports resuming from checkpoints via --resume_from_checkpoint argument.
+    When interrupted (SIGTERM/SIGINT), saves checkpoint and exits gracefully.
     """
     (
         reap_args,
@@ -678,6 +1043,22 @@ def main():
 
     results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
 
+    # Setup checkpoint directory
+    checkpoint_base_dir = results_dir / "checkpoints"
+    checkpoint_base_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check for resume from checkpoint
+    resume_checkpoint = None
+    if hasattr(merge_args, 'resume_from_checkpoint') and merge_args.resume_from_checkpoint:
+        resume_checkpoint = pathlib.Path(merge_args.resume_from_checkpoint)
+        if not resume_checkpoint.exists():
+            raise ValueError(f"Checkpoint not found: {resume_checkpoint}")
+    elif hasattr(merge_args, 'auto_resume') and merge_args.auto_resume:
+        # Auto-detect latest checkpoint
+        resume_checkpoint = find_latest_checkpoint(checkpoint_base_dir)
+        if resume_checkpoint:
+            logger.info(f"Auto-resuming from latest checkpoint: {resume_checkpoint}")
+
     # Load model
     model_name = patched_model_map(model_args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -689,36 +1070,42 @@ def main():
     )
 
     model_attrs = MODEL_ATTRS[model.__class__.__name__]
+    device = next(model.parameters()).device
 
-    # Load calibration data
-    logger.info("Loading REAM mixed calibration data...")
-    if ds_args.dataset_name == "ream_mixed":
-        calibration_inputs = load_ream_calibration_data(
-            tokenizer=tokenizer,
-            max_length=obs_args.model_max_length or 2048,
-            seed=reap_args.seed,
-        )
+    # Load calibration data (or restore from checkpoint)
+    if resume_checkpoint:
+        logger.info(f"Restoring calibration data from checkpoint...")
+        checkpoint_data = load_checkpoint(resume_checkpoint, model, device)
+        calibration_inputs = checkpoint_data["calibration_inputs"]
     else:
-        # Fall back to single dataset mode
-        from ream.main import record_activations
-        logger.info(f"Using single dataset: {ds_args.dataset_name}")
-        # Use the standard observer pipeline to get calibration data
-        from ream.data import DATASET_REGISTRY
-        raw_ds = load_dataset(ds_args.dataset_name, split=ds_args.split)
-        proc_cls = DATASET_REGISTRY.get(ds_args.dataset_name)
-        if proc_cls is None:
-            raise ValueError(f"No DatasetProcessor for '{ds_args.dataset_name}'")
-        processor = proc_cls(
-            dataset=raw_ds,
-            tokenizer=tokenizer,
-            max_input_len=obs_args.model_max_length,
-            split=ds_args.split,
-            split_by_category=False,
-        )
-        category_data = processor.get_processed_dataset(obs_args.samples_per_category)
-        calibration_inputs = []
-        for cat_data in category_data.values():
-            calibration_inputs.extend(cat_data)
+        logger.info("Loading REAM mixed calibration data...")
+        if ds_args.dataset_name == "ream_mixed":
+            calibration_inputs = load_ream_calibration_data(
+                tokenizer=tokenizer,
+                max_length=obs_args.model_max_length or 2048,
+                seed=reap_args.seed,
+            )
+        else:
+            # Fall back to single dataset mode
+            from ream.main import record_activations
+            logger.info(f"Using single dataset: {ds_args.dataset_name}")
+            # Use the standard observer pipeline to get calibration data
+            from ream.data import DATASET_REGISTRY
+            raw_ds = load_dataset(ds_args.dataset_name, split=ds_args.split)
+            proc_cls = DATASET_REGISTRY.get(ds_args.dataset_name)
+            if proc_cls is None:
+                raise ValueError(f"No DatasetProcessor for '{ds_args.dataset_name}'")
+            processor = proc_cls(
+                dataset=raw_ds,
+                tokenizer=tokenizer,
+                max_input_len=obs_args.model_max_length,
+                split=ds_args.split,
+                split_by_category=False,
+            )
+            category_data = processor.get_processed_dataset(obs_args.samples_per_category)
+            calibration_inputs = []
+            for cat_data in category_data.values():
+                calibration_inputs.extend(cat_data)
 
     # Compute num_clusters
     experts_sample = getattr(get_moe(model, 0), model_attrs["experts"])
@@ -734,7 +1121,7 @@ def main():
     logger.info(f"REAM config: {num_experts_sample} -> {num_clusters} experts, "
                 f"max_cluster_size={max_cluster_size}")
 
-    # Run REAM sequential merge
+    # Run REAM sequential merge with checkpointing
     result = ream_sequential_merge(
         model=model,
         tokenizer=tokenizer,
@@ -746,6 +1133,12 @@ def main():
         prune_gate=True,
         skip_first=merge_args.skip_first,
         skip_last=merge_args.skip_last,
+        checkpoint_dir=checkpoint_base_dir,
+        checkpoint_interval=getattr(merge_args, 'checkpoint_interval', 1),
+        seed=reap_args.seed,
+        model_name=model_args.model_name,
+        results_dir=results_dir,
+        resume_from_checkpoint=resume_checkpoint,
     )
 
     cluster_labels = result["cluster_labels"]

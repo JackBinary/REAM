@@ -362,6 +362,33 @@ class MergeArgs:
             )
         },
     )
+    resume_from_checkpoint: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to checkpoint directory to resume from. "
+                "If None, starts from scratch or uses auto_resume."
+            )
+        },
+    )
+    auto_resume: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to automatically resume from the latest checkpoint "
+                "in the results directory. Ignored if resume_from_checkpoint is set."
+            )
+        },
+    )
+    checkpoint_interval: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Save checkpoint every N layers. Default: 1 (checkpoint after each layer). "
+                "Set to higher values to reduce checkpoint overhead."
+            )
+        },
+    )
 
 @dataclass
 class KdArgs:
