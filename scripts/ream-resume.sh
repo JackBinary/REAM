@@ -9,6 +9,7 @@
 #   ./ream-resume.sh                    # Start new run or auto-resume
 #   ./ream-resume.sh --resume_from_checkpoint /path/to/checkpoint  # Resume from specific checkpoint
 #   NUM_GPUS=4 ./ream-resume.sh         # Use 4 GPUs in parallel
+#   NUM_WORKERS=32 ./ream-resume.sh     # Use 32 CPU workers for parallel processing
 #
 # For interruptible cloud instances (2/3 the price of continuous):
 #   1. Start this script on an interruptible instance
@@ -20,6 +21,11 @@
 #   - Set NUM_GPUS environment variable to use multiple GPUs in parallel
 #   - Each GPU gets a copy of the model and processes calibration data in parallel
 #   - Provides near-linear speedup (e.g., 4 GPUs = ~4x faster)
+#
+# For multi-CPU speedup:
+#   - Set NUM_WORKERS to the number of CPU cores available
+#   - Speeds up tokenization, similarity computation, and dataset loading
+#   - With 64 vCPUs, set NUM_WORKERS=64 for maximum speedup
 
 set -e
 
@@ -29,6 +35,7 @@ DATASET="${DATASET:-ream_mixed}"
 COMPRESSION_RATIO="${COMPRESSION_RATIO:-0.5}"
 SEED="${SEED:-42}"
 NUM_GPUS="${NUM_GPUS:-1}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
 
 # Parse command line arguments
 EXTRA_ARGS=()
@@ -56,6 +63,7 @@ python -m ream.ream \
     --compression_ratio "$COMPRESSION_RATIO" \
     --seed "$SEED" \
     --num_gpus "$NUM_GPUS" \
+    --num_workers "$NUM_WORKERS" \
     --auto_resume \
     "${EXTRA_ARGS[@]}"
 

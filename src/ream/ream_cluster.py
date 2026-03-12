@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 import logging
 from typing import Optional
+import multiprocessing as mp
+from functools import partial
 
 logger = logging.getLogger(__name__)
 
@@ -65,24 +67,57 @@ def compute_gated_similarity_matrix(
     expert_outputs: torch.Tensor,
     gate_logits: torch.Tensor,
     num_experts: int,
+    num_workers: int = 8,
 ) -> torch.Tensor:
     """
     Compute the full NxN gated similarity matrix between all experts.
+    
+    Uses multiprocessing to parallelize similarity computation across CPU cores.
 
     Args:
         expert_outputs: (num_experts, num_tokens, hidden_dim)
         gate_logits: (num_tokens, num_experts) softmax router outputs
         num_experts: N
+        num_workers: Number of CPU workers for parallel computation (default: 8)
 
     Returns:
         (N, N) similarity matrix
     """
-    sim_matrix = torch.zeros(num_experts, num_experts)
-    for i in range(num_experts):
-        for j in range(i + 1, num_experts):
+    # Move tensors to CPU for parallel processing
+    expert_outputs = expert_outputs.cpu()
+    gate_logits = gate_logits.cpu()
+    
+    # Generate all pairs (i, j) where i < j
+    pairs = [(i, j) for i in range(num_experts) for j in range(i + 1, num_experts)]
+    
+    if num_workers > 1 and len(pairs) > 100:
+        # Use multiprocessing for large matrices
+        logger.info(f"Computing {len(pairs)} similarity pairs with {num_workers} workers...")
+        
+        # Worker function
+        def compute_pair(pair):
+            i, j = pair
             s = gated_similarity(expert_outputs, gate_logits, i, j)
+            return (i, j, s)
+        
+        with mp.Pool(num_workers) as pool:
+            results = pool.map(compute_pair, pairs)
+        
+        # Build similarity matrix
+        sim_matrix = torch.zeros(num_experts, num_experts)
+        for i, j, s in results:
             sim_matrix[i, j] = s
             sim_matrix[j, i] = s
+    else:
+        # Single-threaded for small matrices
+        logger.info(f"Computing {len(pairs)} similarity pairs (single-threaded)...")
+        sim_matrix = torch.zeros(num_experts, num_experts)
+        for i in range(num_experts):
+            for j in range(i + 1, num_experts):
+                s = gated_similarity(expert_outputs, gate_logits, i, j)
+                sim_matrix[i, j] = s
+                sim_matrix[j, i] = s
+    
     return sim_matrix
 
 
@@ -93,6 +128,7 @@ def ream_clustering(
     num_experts: int,
     num_clusters: int,
     max_cluster_size: int = 16,
+    num_workers: int = 8,
 ) -> torch.Tensor:
     """
     REAM clustering with pseudo-pruning grouping.
@@ -115,6 +151,7 @@ def ream_clustering(
         num_experts: N
         num_clusters: k (target number of merged experts)
         max_cluster_size: C, max experts per cluster (default 16)
+        num_workers: Number of CPU workers for parallel computation (default 8)
 
     Returns:
         (N,) cluster label tensor. Centroid experts get their own cluster id.
@@ -135,7 +172,7 @@ def ream_clustering(
     # Step 2: Compute gated similarity matrix
     logger.info("Computing gated similarity matrix...")
     sim_matrix = compute_gated_similarity_matrix(
-        expert_outputs, gate_logits, num_experts
+        expert_outputs, gate_logits, num_experts, num_workers
     )
 
     # Step 3: Pseudo-pruning grouping

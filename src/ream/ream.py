@@ -769,6 +769,7 @@ def ream_merge_layer(
     merge_method: str = "frequency_weighted_average",
     use_activation_weight_permute: bool = True,
     prune_gate: bool = True,
+    num_workers: int = 8,
 ):
     """
     Run the full REAM merge pipeline for a single MoE layer.
@@ -789,6 +790,7 @@ def ream_merge_layer(
         merge_method: How to combine expert weights
         use_activation_weight_permute: Whether to use activation+weight permutation
         prune_gate: Whether to prune gate weights after merging
+        num_workers: Number of CPU workers for parallel computation (default: 8)
     """
     reap_scores = layer_data["reap_scores"]
     expert_outputs = layer_data["expert_outputs"]
@@ -808,6 +810,7 @@ def ream_merge_layer(
         num_experts=num_experts,
         num_clusters=num_clusters,
         max_cluster_size=max_cluster_size,
+        num_workers=num_workers,
     )
 
     # Identify centroids (the expert with highest REAP score in each cluster)
@@ -915,6 +918,7 @@ def ream_sequential_merge(
     results_dir: Optional[pathlib.Path] = None,
     resume_from_checkpoint: Optional[pathlib.Path] = None,
     num_gpus: int = 1,
+    num_workers: int = 8,
 ) -> dict:
     """
     Run the full REAM sequential merging pipeline with checkpointing support.
@@ -931,6 +935,9 @@ def ream_sequential_merge(
     Supports multi-GPU parallelization for calibration data collection.
     Each GPU gets a copy of the model and processes a subset of calibration
     data in parallel, providing near-linear speedup.
+
+    Supports multi-CPU parallelization for CPU-bound tasks (tokenization,
+    similarity computation, etc.).
 
     Args:
         model: The MoE model to compress
@@ -950,6 +957,7 @@ def ream_sequential_merge(
         results_dir: Results directory for checkpoint metadata
         resume_from_checkpoint: Path to checkpoint to resume from
         num_gpus: Number of GPUs to use in parallel (default: 1)
+        num_workers: Number of CPU workers for parallel tasks (default: 8)
 
     Returns:
         Dict with cluster_labels and centroid_indices per layer
@@ -1074,6 +1082,7 @@ def ream_sequential_merge(
                 merge_method=merge_method,
                 use_activation_weight_permute=use_activation_weight_permute,
                 prune_gate=prune_gate,
+                num_workers=num_workers,
             )
 
             all_cluster_labels[layer_idx] = cluster_labels
@@ -1145,6 +1154,44 @@ def ream_sequential_merge(
 # Calibration data loading (mixed: c4 + math + coding)
 # ---------------------------------------------------------------------------
 
+def _tokenize_batch(
+    texts: list[str],
+    tokenizer_name: str,
+    max_tokens: int,
+    trust_remote_code: bool = True,
+) -> list[torch.Tensor]:
+    """
+    Tokenize a batch of texts (worker function for multiprocessing).
+    
+    Args:
+        texts: List of text strings to tokenize
+        tokenizer_name: Name or path of tokenizer
+        max_tokens: Maximum tokens per sample
+        trust_remote_code: Whether to trust remote code
+        
+    Returns:
+        List of tokenized input tensors
+    """
+    from transformers import AutoTokenizer
+    
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name, 
+        trust_remote_code=trust_remote_code
+    )
+    
+    results = []
+    for text in texts:
+        tokens = tokenizer(
+            text, 
+            return_tensors="pt", 
+            truncation=True, 
+            max_length=max_tokens
+        )
+        results.append(tokens["input_ids"])
+    
+    return results
+
+
 def load_ream_calibration_data(
     tokenizer: AutoTokenizer,
     max_length: int = 2048,
@@ -1155,9 +1202,12 @@ def load_ream_calibration_data(
     math_max_tokens: int = 512,
     code_max_tokens: int = 512,
     seed: int = 42,
+    num_workers: int = 8,
 ) -> list[torch.Tensor]:
     """
     Load the mixed calibration dataset used in REAM experiments.
+
+    Uses multiprocessing to parallelize tokenization across CPU cores.
 
     Table 1 from the blog post:
       - General: allenai/c4/en (512 samples, 128 max tokens, ~8% of data)
@@ -1174,15 +1224,45 @@ def load_ream_calibration_data(
         math_max_tokens: Max tokens per math sample
         code_max_tokens: Max tokens per code sample
         seed: Random seed
+        num_workers: Number of CPU workers for parallel tokenization (default: 8)
 
     Returns:
         List of tokenized input tensors
     """
     import random
+    import multiprocessing as mp
+    from functools import partial
+    
     random.seed(seed)
     torch.manual_seed(seed)
 
     all_inputs = []
+    tokenizer_name = tokenizer.name_or_path
+    
+    # Helper to tokenize in parallel
+    def tokenize_parallel(texts: list[str], max_tokens: int, desc: str) -> list[torch.Tensor]:
+        if not texts:
+            return []
+        
+        logger.info(f"Tokenizing {len(texts)} {desc} samples with {num_workers} workers...")
+        
+        # Split texts into chunks for parallel processing
+        chunk_size = max(1, len(texts) // num_workers)
+        chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
+        
+        # Use multiprocessing pool
+        with mp.Pool(num_workers) as pool:
+            results = pool.starmap(
+                _tokenize_batch,
+                [(chunk, tokenizer_name, max_tokens) for chunk in chunks]
+            )
+        
+        # Flatten results
+        flattened = []
+        for chunk_result in results:
+            flattened.extend(chunk_result)
+        
+        return flattened
 
     # 1. C4 (general text)
     logger.info("Loading C4 calibration data...")
@@ -1190,11 +1270,11 @@ def load_ream_calibration_data(
         c4_url = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
         c4_ds = load_dataset("json", data_files={"train": c4_url}, split="train", streaming=False)
         c4_indices = random.sample(range(len(c4_ds)), min(c4_samples, len(c4_ds)))
-        for idx in c4_indices:
-            text = c4_ds[idx]["text"]
-            tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=c4_max_tokens)
-            all_inputs.append(tokens["input_ids"])
-        logger.info(f"Loaded {len(c4_indices)} C4 samples")
+        c4_texts = [c4_ds[idx]["text"] for idx in c4_indices]
+        
+        c4_tokens = tokenize_parallel(c4_texts, c4_max_tokens, "C4")
+        all_inputs.extend(c4_tokens)
+        logger.info(f"Loaded {len(c4_tokens)} C4 samples")
     except Exception as e:
         logger.warning(f"Failed to load C4 data: {e}. Skipping.")
 
@@ -1208,14 +1288,18 @@ def load_ream_calibration_data(
         )
         # Filter for cn_k12 and olympiads subsets
         math_ds = math_ds.filter(
-            lambda x: x.get("source", "") in ["cn_k12", "olympiads"]
+            lambda x: x.get("source", "") in ["cn_k12", "olympiads"],
+            num_proc=num_workers,  # Use multiprocessing for filtering
         )
         math_indices = random.sample(range(len(math_ds)), min(math_samples, len(math_ds)))
-        for idx in math_indices:
-            text = math_ds[idx].get("problem", "") + " " + math_ds[idx].get("solution", "")
-            tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=math_max_tokens)
-            all_inputs.append(tokens["input_ids"])
-        logger.info(f"Loaded {len(math_indices)} NuminaMath samples")
+        math_texts = [
+            math_ds[idx].get("problem", "") + " " + math_ds[idx].get("solution", "")
+            for idx in math_indices
+        ]
+        
+        math_tokens = tokenize_parallel(math_texts, math_max_tokens, "NuminaMath")
+        all_inputs.extend(math_tokens)
+        logger.info(f"Loaded {len(math_tokens)} NuminaMath samples")
     except Exception as e:
         logger.warning(f"Failed to load NuminaMath data: {e}. Skipping.")
 
@@ -1228,13 +1312,14 @@ def load_ream_calibration_data(
             split="train",
             streaming=False,
             trust_remote_code=True,
+            num_proc=num_workers,  # Use multiprocessing for loading
         )
         code_indices = random.sample(range(len(code_ds)), min(code_samples, len(code_ds)))
-        for idx in code_indices:
-            text = code_ds[idx].get("content", "")
-            tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=code_max_tokens)
-            all_inputs.append(tokens["input_ids"])
-        logger.info(f"Loaded {len(code_indices)} code samples")
+        code_texts = [code_ds[idx].get("content", "") for idx in code_indices]
+        
+        code_tokens = tokenize_parallel(code_texts, code_max_tokens, "code")
+        all_inputs.extend(code_tokens)
+        logger.info(f"Loaded {len(code_tokens)} code samples")
     except Exception as e:
         logger.warning(f"Failed to load the-stack-smol data: {e}. Skipping.")
 
@@ -1320,6 +1405,7 @@ def main():
                 tokenizer=tokenizer,
                 max_length=obs_args.model_max_length or 2048,
                 seed=reap_args.seed,
+                num_workers=getattr(merge_args, 'num_workers', 8),
             )
         else:
             # Fall back to single dataset mode
@@ -1376,6 +1462,7 @@ def main():
         results_dir=results_dir,
         resume_from_checkpoint=resume_checkpoint,
         num_gpus=getattr(merge_args, 'num_gpus', 1),
+        num_workers=getattr(merge_args, 'num_workers', 8),
     )
 
     cluster_labels = result["cluster_labels"]

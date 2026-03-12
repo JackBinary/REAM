@@ -399,6 +399,16 @@ class MergeArgs:
             )
         },
     )
+    num_workers: int = field(
+        default=8,
+        metadata={
+            "help": (
+                "Number of CPU workers for parallel processing of CPU-bound tasks. "
+                "Used for tokenization, similarity computation, and dataset loading. "
+                "Set to number of CPU cores for maximum speedup. Default: 8."
+            )
+        },
+    )
 
 @dataclass
 class KdArgs:
