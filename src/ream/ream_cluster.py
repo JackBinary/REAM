@@ -94,20 +94,32 @@ def compute_gated_similarity_matrix(
         # Use multiprocessing for large matrices
         logger.info(f"Computing {len(pairs)} similarity pairs with {num_workers} workers...")
         
-        # Worker function
-        def compute_pair(pair):
+        # Worker function - must be at module level for pickling
+        # We'll use a closure to capture the tensors
+        def compute_pair_wrapper(pair):
             i, j = pair
+            # Compute similarity (returns scalar float)
             s = gated_similarity(expert_outputs, gate_logits, i, j)
-            return (i, j, s)
+            return (i, j, float(s))
         
-        with mp.Pool(num_workers) as pool:
-            results = pool.map(compute_pair, pairs)
-        
-        # Build similarity matrix
-        sim_matrix = torch.zeros(num_experts, num_experts)
-        for i, j, s in results:
-            sim_matrix[i, j] = s
-            sim_matrix[j, i] = s
+        try:
+            with mp.Pool(num_workers) as pool:
+                results = pool.map(compute_pair_wrapper, pairs)
+            
+            # Build similarity matrix
+            sim_matrix = torch.zeros(num_experts, num_experts)
+            for i, j, s in results:
+                sim_matrix[i, j] = s
+                sim_matrix[j, i] = s
+        except Exception as e:
+            logger.warning(f"Multiprocessing failed: {e}. Falling back to single-threaded.")
+            # Fallback to single-threaded
+            sim_matrix = torch.zeros(num_experts, num_experts)
+            for i in range(num_experts):
+                for j in range(i + 1, num_experts):
+                    s = gated_similarity(expert_outputs, gate_logits, i, j)
+                    sim_matrix[i, j] = s
+                    sim_matrix[j, i] = s
     else:
         # Single-threaded for small matrices
         logger.info(f"Computing {len(pairs)} similarity pairs (single-threaded)...")

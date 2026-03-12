@@ -543,6 +543,13 @@ def collect_layer_data(
     import torch.multiprocessing as mp
     from functools import partial
     
+    # Set multiprocessing start method to 'spawn' for CUDA compatibility
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # Already set
+        pass
+    
     # Detect available GPUs
     available_gpus = list(range(torch.cuda.device_count()))
     if len(available_gpus) < num_gpus:
@@ -621,10 +628,21 @@ def collect_layer_data(
                 max_hidden_tokens=max_hidden_tokens,
             )
             
-            result_queue.put((gpu_id, result))
+            # Move all tensors to CPU to avoid multiprocessing sharing issues
+            result_cpu = {
+                "reap_scores": result["reap_scores"].cpu(),
+                "expert_outputs": result["expert_outputs"].cpu(),
+                "gate_logits": result["gate_logits"].cpu(),
+                "expert_hidden": {k: v.cpu() for k, v in result["expert_hidden"].items()},
+                "expert_frequency": result["expert_frequency"].cpu(),
+                "total_tokens": result["total_tokens"],
+            }
+            
+            result_queue.put((gpu_id, result_cpu))
             
             # Clean up
             del local_model
+            del result
             torch.cuda.empty_cache()
             
         except Exception as e:
@@ -1159,7 +1177,7 @@ def _tokenize_batch(
     tokenizer_name: str,
     max_tokens: int,
     trust_remote_code: bool = True,
-) -> list[torch.Tensor]:
+) -> list[list[int]]:
     """
     Tokenize a batch of texts (worker function for multiprocessing).
     
@@ -1170,7 +1188,7 @@ def _tokenize_batch(
         trust_remote_code: Whether to trust remote code
         
     Returns:
-        List of tokenized input tensors
+        List of token ID lists (not tensors, to avoid multiprocessing issues)
     """
     from transformers import AutoTokenizer
     
@@ -1187,7 +1205,8 @@ def _tokenize_batch(
             truncation=True, 
             max_length=max_tokens
         )
-        results.append(tokens["input_ids"])
+        # Convert to list to avoid multiprocessing tensor sharing issues
+        results.append(tokens["input_ids"][0].tolist())
     
     return results
 
@@ -1246,23 +1265,43 @@ def load_ream_calibration_data(
         
         logger.info(f"Tokenizing {len(texts)} {desc} samples with {num_workers} workers...")
         
+        # For small datasets or single worker, use single-threaded
+        if num_workers <= 1 or len(texts) < 10:
+            logger.info(f"Using single-threaded tokenization for {len(texts)} samples")
+            results = []
+            for text in texts:
+                tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_tokens)
+                results.append(tokens["input_ids"])
+            return results
+        
         # Split texts into chunks for parallel processing
         chunk_size = max(1, len(texts) // num_workers)
         chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
         
-        # Use multiprocessing pool
-        with mp.Pool(num_workers) as pool:
-            results = pool.starmap(
-                _tokenize_batch,
-                [(chunk, tokenizer_name, max_tokens) for chunk in chunks]
-            )
-        
-        # Flatten results
-        flattened = []
-        for chunk_result in results:
-            flattened.extend(chunk_result)
-        
-        return flattened
+        try:
+            # Use multiprocessing pool
+            with mp.Pool(num_workers) as pool:
+                results = pool.starmap(
+                    _tokenize_batch,
+                    [(chunk, tokenizer_name, max_tokens) for chunk in chunks]
+                )
+            
+            # Flatten results and convert back to tensors
+            flattened = []
+            for chunk_result in results:
+                for token_list in chunk_result:
+                    # Convert list back to tensor
+                    flattened.append(torch.tensor([token_list]))
+            
+            return flattened
+        except Exception as e:
+            logger.warning(f"Multiprocessing failed: {e}. Falling back to single-threaded.")
+            # Fallback to single-threaded
+            results = []
+            for text in texts:
+                tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_tokens)
+                results.append(tokens["input_ids"])
+            return results
 
     # 1. C4 (general text)
     logger.info("Loading C4 calibration data...")
