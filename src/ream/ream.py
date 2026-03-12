@@ -61,7 +61,7 @@ def _collect_layer_data_worker(
     gpu_id: int,
     calib_chunk: list,
     model_name: str,
-    model_state: dict,
+    model_state_path: str,
     layer_idx: int,
     model_attrs: dict,
     max_sim_tokens: int,
@@ -86,7 +86,8 @@ def _collect_layer_data_worker(
             trust_remote_code=True,
         )
         
-        # Load the (possibly merged) state
+        # Load the (possibly merged) state from disk (avoids file descriptor limits)
+        model_state = torch.load(model_state_path, map_location=device, weights_only=True)
         local_model.load_state_dict(model_state)
         local_model.eval()
         
@@ -663,34 +664,43 @@ def collect_layer_data(
             max_hidden_tokens=max_hidden_tokens,
         )
     
-    # Prepare model state dict for replication
+    # Save model state to temp file (avoids file descriptor limits from passing through mp.Queue)
+    import tempfile
     model_state = model.state_dict()
+    with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as f:
+        model_state_path = f.name
+        torch.save(model_state, model_state_path)
     
-    # Launch workers using module-level function (required for pickling with spawn)
-    result_queue = mp.Queue()
-    processes = []
-    
-    for gpu_id, chunk in zip(gpus_to_use, chunks):
-        if not chunk:
-            continue
-        p = mp.Process(
-            target=_collect_layer_data_worker,
-            args=(gpu_id, chunk, model_name, model_state, layer_idx, 
-                  model_attrs, max_sim_tokens, max_hidden_tokens, num_gpus, result_queue)
-        )
-        p.start()
-        processes.append(p)
-    
-    # Collect results
-    results = {}
-    for _ in range(len(processes)):
-        gpu_id, result = result_queue.get()
-        if result is not None:
-            results[gpu_id] = result
-    
-    # Wait for all processes to finish
-    for p in processes:
-        p.join()
+    try:
+        # Launch workers using module-level function (required for pickling with spawn)
+        result_queue = mp.Queue()
+        processes = []
+        
+        for gpu_id, chunk in zip(gpus_to_use, chunks):
+            if not chunk:
+                continue
+            p = mp.Process(
+                target=_collect_layer_data_worker,
+                args=(gpu_id, chunk, model_name, model_state_path, layer_idx, 
+                      model_attrs, max_sim_tokens, max_hidden_tokens, num_gpus, result_queue)
+            )
+            p.start()
+            processes.append(p)
+        
+        # Collect results
+        results = {}
+        for _ in range(len(processes)):
+            gpu_id, result = result_queue.get()
+            if result is not None:
+                results[gpu_id] = result
+        
+        # Wait for all processes to finish
+        for p in processes:
+            p.join()
+    finally:
+        # Clean up temp file
+        import os
+        os.unlink(model_state_path)
     
     if not results:
         raise RuntimeError(f"All GPU workers failed for layer {layer_idx}")
