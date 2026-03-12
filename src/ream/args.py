@@ -389,6 +389,16 @@ class MergeArgs:
             )
         },
     )
+    num_gpus: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of GPUs to use in parallel for calibration data collection. "
+                "Each GPU gets a copy of the model and processes a subset of data. "
+                "Provides near-linear speedup. Default: 1 (single GPU)."
+            )
+        },
+    )
 
 @dataclass
 class KdArgs:

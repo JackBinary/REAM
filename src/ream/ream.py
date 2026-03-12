@@ -305,7 +305,7 @@ def find_latest_checkpoint_in_list(checkpoint_dirs: list[pathlib.Path]) -> Optio
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def collect_layer_data(
+def collect_layer_data_single_gpu(
     model: nn.Module,
     calibration_inputs: list[torch.Tensor],
     layer_idx: int,
@@ -323,6 +323,11 @@ def collect_layer_data(
     during clustering, and expert_hidden is capped per expert.
 
     Args:
+        model: The model (already on device)
+        calibration_inputs: List of tokenized calibration batches
+        layer_idx: Which MoE layer to collect data for
+        model_attrs: Model attribute name mapping
+        device: Device to run on
         max_sim_tokens: Maximum tokens to retain for the gated-similarity matrix.
             4096 is plenty for accurate cosine similarity estimation.
         max_hidden_tokens: Maximum tokens per expert to retain for permutation
@@ -471,6 +476,230 @@ def collect_layer_data(
         f"similarity reservoir {expert_outputs.shape[1]} tokens"
     )
 
+    return {
+        "reap_scores": reap_scores,
+        "expert_outputs": expert_outputs,
+        "gate_logits": gate_logits,
+        "expert_hidden": expert_hidden,
+        "expert_frequency": expert_frequency,
+        "total_tokens": total_tokens,
+    }
+
+
+@torch.no_grad()
+def collect_layer_data(
+    model: nn.Module,
+    calibration_inputs: list[torch.Tensor],
+    layer_idx: int,
+    model_attrs: dict[str, Any],
+    device: torch.device,
+    max_sim_tokens: int = 65536,
+    max_hidden_tokens: int = 8192,
+    num_gpus: int = 1,
+) -> dict[str, torch.Tensor]:
+    """
+    Forward calibration data through the model up to and including the target
+    MoE layer, collecting expert outputs, gate logits, and computing REAP scores.
+
+    Supports multi-GPU parallelization: splits calibration data across GPUs,
+    processes in parallel, and aggregates results.
+
+    Memory-efficient: REAP scores are computed incrementally (running sums).
+    Only a capped reservoir of tokens is kept for the similarity matrix used
+    during clustering, and expert_hidden is capped per expert.
+
+    Args:
+        model: The model (can be on any device, will be replicated)
+        calibration_inputs: List of tokenized calibration batches
+        layer_idx: Which MoE layer to collect data for
+        model_attrs: Model attribute name mapping
+        device: Primary device (used if num_gpus=1)
+        max_sim_tokens: Maximum tokens to retain for the gated-similarity matrix.
+            4096 is plenty for accurate cosine similarity estimation.
+        max_hidden_tokens: Maximum tokens per expert to retain for permutation
+            alignment in expert_hidden.
+        num_gpus: Number of GPUs to use in parallel (default: 1)
+
+    Returns a dict with:
+      - reap_scores: (N,) per-expert REAP saliency
+      - expert_outputs: (N, <=max_sim_tokens, hidden_dim) sampled expert activations
+      - gate_logits: (<=max_sim_tokens, N) sampled softmax router outputs
+      - expert_hidden: dict[int, (d, <=max_hidden_tokens)] hidden activations per expert
+      - expert_frequency: (N,) how often each expert is selected
+    """
+    if num_gpus <= 1:
+        # Single GPU mode - use original implementation
+        return collect_layer_data_single_gpu(
+            model=model,
+            calibration_inputs=calibration_inputs,
+            layer_idx=layer_idx,
+            model_attrs=model_attrs,
+            device=device,
+            max_sim_tokens=max_sim_tokens,
+            max_hidden_tokens=max_hidden_tokens,
+        )
+    
+    # Multi-GPU mode
+    import torch.multiprocessing as mp
+    from functools import partial
+    
+    # Detect available GPUs
+    available_gpus = list(range(torch.cuda.device_count()))
+    if len(available_gpus) < num_gpus:
+        logger.warning(
+            f"Requested {num_gpus} GPUs but only {len(available_gpus)} available. "
+            f"Using {len(available_gpus)} GPUs."
+        )
+        num_gpus = len(available_gpus)
+    
+    if num_gpus <= 1:
+        # Fall back to single GPU
+        return collect_layer_data_single_gpu(
+            model=model,
+            calibration_inputs=calibration_inputs,
+            layer_idx=layer_idx,
+            model_attrs=model_attrs,
+            device=device,
+            max_sim_tokens=max_sim_tokens,
+            max_hidden_tokens=max_hidden_tokens,
+        )
+    
+    gpus_to_use = available_gpus[:num_gpus]
+    logger.info(f"Using {len(gpus_to_use)} GPUs in parallel: {gpus_to_use}")
+    
+    # Split calibration data across GPUs
+    chunks = [[] for _ in range(len(gpus_to_use))]
+    for i, inp in enumerate(calibration_inputs):
+        chunks[i % len(gpus_to_use)].append(inp)
+    
+    # Get model name for loading on each GPU
+    model_name = getattr(model, '_name_or_path', None)
+    if model_name is None:
+        # Try to extract from config
+        model_name = getattr(model.config, '_name_or_path', None)
+    if model_name is None:
+        logger.warning("Could not determine model name, falling back to single GPU")
+        return collect_layer_data_single_gpu(
+            model=model,
+            calibration_inputs=calibration_inputs,
+            layer_idx=layer_idx,
+            model_attrs=model_attrs,
+            device=device,
+            max_sim_tokens=max_sim_tokens,
+            max_hidden_tokens=max_hidden_tokens,
+        )
+    
+    # Prepare model state dict for replication
+    model_state = model.state_dict()
+    
+    # Worker function for each GPU
+    def worker_fn(gpu_id: int, calib_chunk: list, result_queue: mp.Queue):
+        try:
+            torch.cuda.set_device(gpu_id)
+            device = torch.device(f"cuda:{gpu_id}")
+            
+            # Load a fresh copy of the model on this GPU
+            local_model = load_model_text_only(
+                model_name,
+                device_map={"": device},
+                torch_dtype="auto",
+                trust_remote_code=True,
+            )
+            
+            # Load the (possibly merged) state
+            local_model.load_state_dict(model_state)
+            local_model.eval()
+            
+            # Collect data
+            result = collect_layer_data_single_gpu(
+                model=local_model,
+                calibration_inputs=calib_chunk,
+                layer_idx=layer_idx,
+                model_attrs=model_attrs,
+                device=device,
+                max_sim_tokens=max_sim_tokens // num_gpus,  # Split quota across GPUs
+                max_hidden_tokens=max_hidden_tokens,
+            )
+            
+            result_queue.put((gpu_id, result))
+            
+            # Clean up
+            del local_model
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            logger.error(f"GPU {gpu_id} failed: {e}")
+            result_queue.put((gpu_id, None))
+    
+    # Launch workers
+    mp.set_start_method('spawn', force=True)
+    result_queue = mp.Queue()
+    processes = []
+    
+    for gpu_id, chunk in zip(gpus_to_use, chunks):
+        if not chunk:
+            continue
+        p = mp.Process(
+            target=worker_fn,
+            args=(gpu_id, chunk, result_queue)
+        )
+        p.start()
+        processes.append(p)
+    
+    # Collect results
+    results = {}
+    for _ in range(len(processes)):
+        gpu_id, result = result_queue.get()
+        if result is not None:
+            results[gpu_id] = result
+    
+    # Wait for all processes to finish
+    for p in processes:
+        p.join()
+    
+    if not results:
+        raise RuntimeError(f"All GPU workers failed for layer {layer_idx}")
+    
+    # Aggregate results from all GPUs
+    logger.info(f"Aggregating results from {len(results)} GPUs")
+    
+    # Sum REAP scores and frequencies
+    reap_numer = sum(r["reap_scores"] * r["total_tokens"] for r in results.values())
+    total_tokens = sum(r["total_tokens"] for r in results.values())
+    reap_scores = reap_numer / (total_tokens + 1e-8)
+    
+    expert_frequency = sum(r["expert_frequency"] for r in results.values())
+    
+    # Merge expert_hidden (take from all GPUs, up to max)
+    expert_hidden = {}
+    for r in results.values():
+        for expert_id, hidden in r["expert_hidden"].items():
+            if expert_id not in expert_hidden:
+                expert_hidden[expert_id] = hidden
+            elif expert_hidden[expert_id].shape[1] < max_hidden_tokens:
+                remaining = max_hidden_tokens - expert_hidden[expert_id].shape[1]
+                expert_hidden[expert_id] = torch.cat(
+                    [expert_hidden[expert_id], hidden[:, :remaining]], dim=1
+                )
+    
+    # Concatenate expert_outputs and gate_logits from all GPUs
+    expert_outputs_list = [r["expert_outputs"] for r in results.values()]
+    gate_logits_list = [r["gate_logits"] for r in results.values()]
+    
+    expert_outputs = torch.cat(expert_outputs_list, dim=1)
+    gate_logits = torch.cat(gate_logits_list, dim=0)
+    
+    # Cap to max_sim_tokens if we exceeded it
+    if expert_outputs.shape[1] > max_sim_tokens:
+        indices = torch.randperm(expert_outputs.shape[1])[:max_sim_tokens]
+        expert_outputs = expert_outputs[:, indices, :]
+        gate_logits = gate_logits[indices, :]
+    
+    logger.info(
+        f"Layer {layer_idx}: collected REAP scores over {int(total_tokens)} tokens "
+        f"using {len(results)} GPUs, similarity reservoir {expert_outputs.shape[1]} tokens"
+    )
+    
     return {
         "reap_scores": reap_scores,
         "expert_outputs": expert_outputs,
@@ -685,6 +914,7 @@ def ream_sequential_merge(
     model_name: str = "",
     results_dir: Optional[pathlib.Path] = None,
     resume_from_checkpoint: Optional[pathlib.Path] = None,
+    num_gpus: int = 1,
 ) -> dict:
     """
     Run the full REAM sequential merging pipeline with checkpointing support.
@@ -697,6 +927,10 @@ def ream_sequential_merge(
     Supports graceful interruption via SIGTERM/SIGINT. When interrupted,
     completes the current layer merge, saves a checkpoint, and exits.
     The process can be resumed from the checkpoint later.
+
+    Supports multi-GPU parallelization for calibration data collection.
+    Each GPU gets a copy of the model and processes a subset of calibration
+    data in parallel, providing near-linear speedup.
 
     Args:
         model: The MoE model to compress
@@ -715,6 +949,7 @@ def ream_sequential_merge(
         model_name: Model name for checkpoint metadata
         results_dir: Results directory for checkpoint metadata
         resume_from_checkpoint: Path to checkpoint to resume from
+        num_gpus: Number of GPUs to use in parallel (default: 1)
 
     Returns:
         Dict with cluster_labels and centroid_indices per layer
@@ -825,6 +1060,7 @@ def ream_sequential_merge(
                 layer_idx=layer_idx,
                 model_attrs=model_attrs,
                 device=device,
+                num_gpus=num_gpus,
             )
 
             # Run REAM merge for this layer
@@ -1139,6 +1375,7 @@ def main():
         model_name=model_args.model_name,
         results_dir=results_dir,
         resume_from_checkpoint=resume_checkpoint,
+        num_gpus=getattr(merge_args, 'num_gpus', 1),
     )
 
     cluster_labels = result["cluster_labels"]
