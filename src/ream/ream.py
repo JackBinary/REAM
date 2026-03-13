@@ -564,6 +564,7 @@ def collect_layer_data(
     max_sim_tokens: int = 65536,
     max_hidden_tokens: int = 8192,
     num_gpus: int = 1,
+    temp_dir: Optional[pathlib.Path] = None,
 ) -> dict[str, torch.Tensor]:
     """
     Forward calibration data through the model up to and including the target
@@ -667,7 +668,9 @@ def collect_layer_data(
     # Save model state to temp file (avoids file descriptor limits from passing through mp.Queue)
     import tempfile
     model_state = model.state_dict()
-    with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as f:
+    # Use temp_dir if provided (e.g., workspace with more disk space), otherwise use default /tmp
+    temp_dir_to_use = str(temp_dir) if temp_dir else None
+    with tempfile.NamedTemporaryFile(suffix='.pt', delete=False, dir=temp_dir_to_use) as f:
         model_state_path = f.name
         torch.save(model_state, model_state_path, _use_new_zipfile_serialization=True)
     
@@ -1114,6 +1117,7 @@ def ream_sequential_merge(
                 model_attrs=model_attrs,
                 device=device,
                 num_gpus=num_gpus,
+                temp_dir=results_dir,
             )
 
             # Run REAM merge for this layer
