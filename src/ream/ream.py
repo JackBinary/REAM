@@ -375,14 +375,14 @@ def collect_layer_data(
     # expert_hidden is already on CPU
     expert_hidden = expert_hidden_cpu
     
-    # Free GPU memory
-    del sim_expert_outputs_cpu, sim_gate_logits_cpu, expert_hidden_cpu
-    del reap_numer, reap_denom, expert_frequency
-    torch.cuda.empty_cache()
-
-    # Calculate statistics using NumPy for faster CPU operations
+    # Calculate statistics using NumPy for faster CPU operations (before deleting GPU tensors)
     expert_freq_np = expert_frequency.cpu().numpy()
     reap_scores_np = reap_scores.cpu().numpy()
+    
+    # Free GPU memory
+    del sim_expert_outputs_cpu, sim_gate_logits_cpu, expert_hidden_cpu
+    del reap_numer, reap_denom
+    torch.cuda.empty_cache()
     
     active_experts = int(np.sum(expert_freq_np > 0))
     avg_reap_score = float(np.mean(reap_scores_np))
