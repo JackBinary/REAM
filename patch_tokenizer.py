@@ -23,8 +23,8 @@ def patch_tokenizer(model_name):
         return False
 
 if __name__ == "__main__":
-    model = sys.argv[1]
-    if not model:
+    if len(sys.argv) < 2:
         print("You must include an HF repo!")
     else:
+        model = sys.argv[1]
         patch_tokenizer(model)
