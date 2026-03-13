@@ -115,17 +115,17 @@ def collect_layer_data(
     cfg = getattr(model.config, "text_config", model.config)
     topk = getattr(cfg, topk_key, 8)
 
-    # --- Online accumulators for REAP scores (keep on GPU) ---
+    # --- Online accumulators for REAP scores (keep on GPU - small fixed size) ---
     reap_numer = torch.zeros(num_experts, device=device, dtype=torch.float32)
     reap_denom = torch.zeros(num_experts, device=device, dtype=torch.float32)
     expert_frequency = torch.zeros(num_experts, device=device, dtype=torch.float32)
     
-    # --- GPU buffers for expert_hidden (accumulate on GPU, transfer once at end) ---
-    expert_hidden_gpu: dict[int, torch.Tensor] = {}
+    # --- CPU buffers for expert_hidden (move to CPU immediately to avoid GPU accumulation) ---
+    expert_hidden_cpu: dict[int, torch.Tensor] = {}
 
-    # --- GPU buffers for similarity data (accumulate on GPU, transfer once at end) ---
-    sim_expert_outputs_gpu: list[torch.Tensor] = []
-    sim_gate_logits_gpu: list[torch.Tensor] = []
+    # --- CPU buffers for similarity data (move to CPU immediately) ---
+    sim_expert_outputs_cpu: list[torch.Tensor] = []
+    sim_gate_logits_cpu: list[torch.Tensor] = []
     sim_tokens_collected = 0
     total_tokens = 0
 
@@ -224,6 +224,15 @@ def collect_layer_data(
                     
                     expert_outs = down_out.transpose(1, 2)  # (num_experts, n_tokens, out)
                     
+                    # Clean up intermediate tensors to prevent memory accumulation
+                    del gate_weights, up_weights, down_weights, gate_out, up_out, hidden, down_out
+                    if gate_bias is not None:
+                        del gate_bias
+                    if up_bias is not None:
+                        del up_bias
+                    if down_bias is not None:
+                        del down_bias
+                    
                 elif has_up and has_down:
                     # Simple MLP expert (up_proj, down_proj)
                     up_weights = torch.stack([getattr(e, 'up_proj').weight for e in experts], dim=0)
@@ -242,6 +251,13 @@ def collect_layer_data(
                         down_out = down_out + down_bias.unsqueeze(-1)
                     
                     expert_outs = down_out.transpose(1, 2)
+                    
+                    # Clean up intermediate tensors
+                    del up_weights, down_weights, up_out, hidden, down_out
+                    if up_bias is not None:
+                        del up_bias
+                    if down_bias is not None:
+                        del down_bias
                     
                 else:
                     # Unknown structure - fall back to sequential
@@ -278,14 +294,14 @@ def collect_layer_data(
         reap_numer += reap_contributions
         reap_denom += counts
         
-        # --- Keep a capped reservoir for similarity matrix (GPU buffers) ---
+        # --- Keep a capped reservoir for similarity matrix (move to CPU immediately) ---
         if sim_tokens_collected < max_sim_tokens:
             n_keep = min(n_tokens, max_sim_tokens - sim_tokens_collected)
-            sim_expert_outputs_gpu.append(expert_outs[:, :n_keep, :].clone())
-            sim_gate_logits_gpu.append(gate_probs[:n_keep, :].clone())
+            sim_expert_outputs_cpu.append(expert_outs[:, :n_keep, :].cpu())
+            sim_gate_logits_cpu.append(gate_probs[:n_keep, :].cpu())
             sim_tokens_collected += n_keep
         
-        # Accumulate expert_hidden on GPU (capped per expert) - VECTORIZED
+        # Accumulate expert_hidden (move to CPU immediately to avoid GPU memory leak)
         # Get all active (expert_idx, token_idx) pairs at once
         active_positions = torch.nonzero(expert_mask)  # (n_active, 2) - (expert_idx, token_idx)
         if active_positions.shape[0] > 0:
@@ -301,34 +317,49 @@ def collect_layer_data(
             # Find boundaries where expert_id changes
             unique_experts, expert_counts = torch.unique_consecutive(sorted_expert_ids, return_counts=True)
             
-            # Process each unique expert (still a loop but no .item() calls, all GPU ops)
+            # Process each unique expert
             offset = 0
             for idx in range(unique_experts.shape[0]):
-                expert_i = unique_experts[idx].item()  # Single .item() per unique expert, not per token
+                expert_i = unique_experts[idx].item()
                 count = expert_counts[idx].item()
                 
                 # Get all tokens for this expert at once
                 expert_token_indices = sorted_token_ids[offset:offset + count]
                 expert_state = expert_outs[expert_i, expert_token_indices]  # (n_tokens, hidden_dim)
                 
-                if expert_i not in expert_hidden_gpu:
-                    n_to_take = min(expert_state.shape[0], max_hidden_tokens)
-                    expert_hidden_gpu[expert_i] = expert_state[:n_to_take].T.clone()
-                elif expert_hidden_gpu[expert_i].shape[1] < max_hidden_tokens:
-                    remaining = max_hidden_tokens - expert_hidden_gpu[expert_i].shape[1]
+                # Move to CPU immediately
+                expert_state_cpu = expert_state[:min(expert_state.shape[0], max_hidden_tokens)].T.cpu()
+                
+                if expert_i not in expert_hidden_cpu:
+                    expert_hidden_cpu[expert_i] = expert_state_cpu
+                elif expert_hidden_cpu[expert_i].shape[1] < max_hidden_tokens:
+                    remaining = max_hidden_tokens - expert_hidden_cpu[expert_i].shape[1]
                     if remaining > 0:
                         n_to_take = min(expert_state.shape[0], remaining)
-                        expert_hidden_gpu[expert_i] = torch.cat(
-                            [expert_hidden_gpu[expert_i], expert_state[:n_to_take].T], dim=1
+                        expert_hidden_cpu[expert_i] = torch.cat(
+                            [expert_hidden_cpu[expert_i], expert_state[:n_to_take].T.cpu()], dim=1
                         )
                 
                 offset += count
         
+        # Explicitly delete GPU tensors to prevent accumulation
+        del expert_outs, expert_mask, norms, gate_probs_t, weighted_norms, reap_contributions
+        del active_positions, expert_ids, token_ids, sorted_indices, sorted_expert_ids, sorted_token_ids
+        del unique_experts, expert_counts
+        if 'expert_state' in locals():
+            del expert_state
+        if 'expert_state_cpu' in locals():
+            del expert_state_cpu
+        
         total_tokens += n_tokens
+        
+        # Periodic GPU cache clearing to prevent fragmentation (every 10 batches)
+        if batch_idx % 10 == 9:
+            torch.cuda.empty_cache()
 
     hook.remove()
 
-    if not sim_expert_outputs_gpu:
+    if not sim_expert_outputs_cpu:
         raise RuntimeError(
             f"No data collected for layer {layer_idx}. "
             "Check that calibration data flows through the model correctly."
@@ -337,15 +368,16 @@ def collect_layer_data(
     # Finalize REAP scores: mean = sum / count
     reap_scores = reap_numer / (reap_denom + 1e-8)
 
-    # Single batch transfer to CPU at the end (much more efficient)
-    expert_outputs = torch.cat(sim_expert_outputs_gpu, dim=1).cpu()
-    gate_logits = torch.cat(sim_gate_logits_gpu, dim=0).cpu()
+    # Concatenate CPU buffers (already on CPU, no transfer needed)
+    expert_outputs = torch.cat(sim_expert_outputs_cpu, dim=1)
+    gate_logits = torch.cat(sim_gate_logits_cpu, dim=0)
     
-    # Transfer expert_hidden to CPU in one batch
-    expert_hidden = {k: v.cpu() for k, v in expert_hidden_gpu.items()}
+    # expert_hidden is already on CPU
+    expert_hidden = expert_hidden_cpu
     
     # Free GPU memory
-    del sim_expert_outputs_gpu, sim_gate_logits_gpu, expert_hidden_gpu
+    del sim_expert_outputs_cpu, sim_gate_logits_cpu, expert_hidden_cpu
+    del reap_numer, reap_denom, expert_frequency
     torch.cuda.empty_cache()
 
     # Calculate statistics using NumPy for faster CPU operations
