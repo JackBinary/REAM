@@ -236,18 +236,18 @@ def save_checkpoint(
     
     # Save model state
     model_path = checkpoint_dir / "model_state.pt"
-    torch.save(model.state_dict(), model_path)
+    torch.save(model.state_dict(), model_path, _use_new_zipfile_serialization=True)
     
     # Save calibration data (tokenized inputs)
     calib_path = checkpoint_dir / "calibration_data.pt"
-    torch.save(calibration_inputs, calib_path)
+    torch.save(calibration_inputs, calib_path, _use_new_zipfile_serialization=True)
     
     # Save cluster labels and centroids
     clusters_path = checkpoint_dir / "clusters.pt"
     torch.save({
         "all_cluster_labels": all_cluster_labels,
         "all_centroid_indices": all_centroid_indices,
-    }, clusters_path)
+    }, clusters_path, _use_new_zipfile_serialization=True)
     
     # Save metadata
     metadata = {
@@ -669,7 +669,7 @@ def collect_layer_data(
     model_state = model.state_dict()
     with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as f:
         model_state_path = f.name
-        torch.save(model_state, model_state_path)
+        torch.save(model_state, model_state_path, _use_new_zipfile_serialization=True)
     
     try:
         # Launch workers using module-level function (required for pickling with spawn)

@@ -88,7 +88,7 @@ class BaseTransformerObserver(ABC):
             file_path.parent.mkdir(parents=True, exist_ok=True)
         state_dict = self.report_state()
         with open(file_path, "wb") as f:
-            torch.save(state_dict, f)
+            torch.save(state_dict, f, _use_new_zipfile_serialization=True)
         logger.info("State saved to %s", file_path)
 
     def _move_state_tensors_to_cpu(self):
