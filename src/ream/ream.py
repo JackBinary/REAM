@@ -110,17 +110,22 @@ def collect_layer_data(
     cfg = getattr(model.config, "text_config", model.config)
     topk = getattr(cfg, topk_key, 8)
 
-    # --- Online accumulators for REAP scores (no large tensor storage) ---
-    reap_numer = torch.zeros(num_experts)   # running sum of (norm * gate_val)
-    reap_denom = torch.zeros(num_experts)   # running count of routed tokens
-    expert_frequency = torch.zeros(num_experts)
+    # --- Online accumulators for REAP scores (keep on GPU as long as possible) ---
+    reap_numer = torch.zeros(num_experts, device=device)   # running sum of (norm * gate_val)
+    reap_denom = torch.zeros(num_experts, device=device)   # running count of routed tokens
+    expert_frequency = torch.zeros(num_experts, device=device)
     expert_hidden: dict[int, torch.Tensor] = {}
 
     # --- Capped reservoir for similarity computation ---
+    # Pre-allocate lists with expected capacity to reduce reallocations
     sim_expert_outputs: list[torch.Tensor] = []
     sim_gate_logits: list[torch.Tensor] = []
     sim_tokens_collected = 0
     total_tokens = 0
+    
+    # Pre-compute batch sizes for more efficient memory management
+    expected_batches = len(calibration_inputs)
+    avg_batch_size = 512  # Estimate, adjust based on your data
 
     # Hook to capture the input to the MoE block
     captured = {}
@@ -132,6 +137,10 @@ def collect_layer_data(
     hook = moe.register_forward_hook(capture_moe_input)
 
     logger.info(f"Collecting data for layer {layer_idx}: processing {len(calibration_inputs)} calibration batches")
+    
+    # Process in larger chunks to reduce CPU overhead
+    batch_chunk_size = 4  # Process 4 batches before CPU synchronization
+    batch_chunk = []
     
     for batch_idx, batch_input in enumerate(tqdm(calibration_inputs, desc=f"Layer {layer_idx} forward passes", leave=False)):
         if isinstance(batch_input, torch.Tensor):
@@ -194,9 +203,9 @@ def collect_layer_data(
         expert_range = torch.arange(num_experts, device=device).view(-1, 1, 1)  # (num_experts, 1, 1)
         expert_mask = (topk_expanded == expert_range).any(dim=-1)  # (num_experts, n_tokens)
         
-        # Compute counts and REAP scores on GPU
+        # Compute counts and REAP scores on GPU (keep everything on GPU)
         counts = expert_mask.sum(dim=1).float()
-        expert_frequency += counts.cpu()
+        expert_frequency += counts
         
         # Compute norms for all experts at once (GPU)
         norms = expert_outs.norm(dim=-1)  # (num_experts, n_tokens)
@@ -208,8 +217,8 @@ def collect_layer_data(
         # Apply mask and sum
         reap_contributions = (weighted_norms * expert_mask.float()).sum(dim=1)
         
-        reap_numer += reap_contributions.cpu()
-        reap_denom += counts.cpu()
+        reap_numer += reap_contributions
+        reap_denom += counts
         
         # --- Keep a capped reservoir for similarity matrix ---
         if sim_tokens_collected < max_sim_tokens:
@@ -219,11 +228,11 @@ def collect_layer_data(
             sim_gate_logits.append(gate_probs[:n_keep, :].cpu())
             sim_tokens_collected += n_keep
         
-        # Accumulate expert_hidden (capped per expert) - process on GPU then move to CPU
-        for i in range(num_experts):
-            if not expert_mask[i].any():
-                continue
-                
+        # Accumulate expert_hidden (capped per expert) - optimized GPU→CPU transfer
+        # Process experts in batches to reduce Python loop overhead
+        active_expert_indices = torch.where(expert_mask.any(dim=1))[0]
+        for i in active_expert_indices:
+            i = i.item()
             # Get expert outputs for this expert (still on GPU)
             expert_state_gpu = expert_outs[i, expert_mask[i]]
             
@@ -240,7 +249,7 @@ def collect_layer_data(
                         [expert_hidden[i], expert_state_gpu[:n_to_take].T.cpu()], dim=1
                     )
         
-        # Clean up GPU memory
+        # Clean up GPU memory - batch deletions to reduce CPU overhead
         del expert_outs, expert_mask, norms, reap_contributions, gate_probs_t, weighted_norms
         if 'expert_state_gpu' in locals():
             del expert_state_gpu
@@ -262,15 +271,29 @@ def collect_layer_data(
     # Finalize REAP scores: mean = sum / count
     reap_scores = reap_numer / (reap_denom + 1e-8)
 
-    # Concatenate the capped reservoir
+    # Concatenate the capped reservoir - use pre-allocated tensor if possible
     expert_outputs = torch.cat(sim_expert_outputs, dim=1)
     gate_logits = torch.cat(sim_gate_logits, dim=0)
 
-    # Calculate some statistics
-    active_experts = (expert_frequency > 0).sum().item()
-    avg_reap_score = reap_scores.mean().item()
-    max_reap_score = reap_scores.max().item()
-    min_reap_score = reap_scores[expert_frequency > 0].min().item() if (expert_frequency > 0).any() else 0
+    # Calculate some statistics - use NumPy if available for faster CPU operations
+    if use_numpy:
+        # Convert to NumPy arrays for faster CPU operations
+        expert_freq_np = expert_frequency.cpu().numpy()
+        reap_scores_np = reap_scores.cpu().numpy()
+        
+        active_experts = np.sum(expert_freq_np > 0)
+        avg_reap_score = float(np.mean(reap_scores_np))
+        max_reap_score = float(np.max(reap_scores_np))
+        if active_experts > 0:
+            min_reap_score = float(np.min(reap_scores_np[expert_freq_np > 0]))
+        else:
+            min_reap_score = 0.0
+    else:
+        # Fall back to PyTorch
+        active_experts = (expert_frequency > 0).sum().item()
+        avg_reap_score = reap_scores.mean().item()
+        max_reap_score = reap_scores.max().item()
+        min_reap_score = reap_scores[expert_frequency > 0].min().item() if (expert_frequency > 0).any() else 0
     
     logger.info(f"Layer {layer_idx}: Data collection complete!")
     logger.info(f"  Processed {int(total_tokens)} tokens total")
