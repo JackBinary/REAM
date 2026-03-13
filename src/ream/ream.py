@@ -173,20 +173,89 @@ def collect_layer_data(
             gate_out = gate_out[0]
         gate_probs = F.softmax(gate_out, dim=-1)
 
-        # Compute expert outputs for all experts
-        expert_outs = torch.empty(
-            num_experts, n_tokens, moe_input.shape[-1],
-            device=device, dtype=moe_input.dtype
-        )
-        
+        # Compute expert outputs for all experts - OPTIMIZED with batched matmul where possible
         if is_fused:
-            # For fused experts, compute sequentially
+            # For fused experts, compute sequentially (fused experts have special handling)
+            expert_outs = torch.empty(
+                num_experts, n_tokens, moe_input.shape[-1],
+                device=device, dtype=moe_input.dtype
+            )
             for i in range(num_experts):
                 expert_outs[i] = fused_expert_forward(experts, i, moe_input)
         else:
-            # For non-fused experts, compute sequentially but keep on GPU
-            for i, expert in enumerate(experts):
-                expert_outs[i] = expert(moe_input)
+            # Try batched computation by stacking expert weights
+            # This runs all experts in parallel via batched matmul
+            try:
+                # Get first expert to check structure
+                first_expert = experts[0]
+                param_names = list(first_expert.state_dict().keys())
+                
+                # Check for standard MLP structure (gate_proj, up_proj, down_proj)
+                has_gate = any('gate_proj' in n for n in param_names)
+                has_up = any('up_proj' in n for n in param_names)
+                has_down = any('down_proj' in n for n in param_names)
+                
+                if has_gate and has_up and has_down:
+                    # SwiGLU-style expert - stack weights for batched matmul
+                    gate_weights = torch.stack([getattr(e, 'gate_proj').weight for e in experts], dim=0)
+                    up_weights = torch.stack([getattr(e, 'up_proj').weight for e in experts], dim=0)
+                    down_weights = torch.stack([getattr(e, 'down_proj').weight for e in experts], dim=0)
+                    
+                    gate_bias = torch.stack([getattr(e, 'gate_proj').bias for e in experts], dim=0) if hasattr(first_expert.gate_proj, 'bias') and first_expert.gate_proj.bias is not None else None
+                    up_bias = torch.stack([getattr(e, 'up_proj').bias for e in experts], dim=0) if hasattr(first_expert.up_proj, 'bias') and first_expert.up_proj.bias is not None else None
+                    down_bias = torch.stack([getattr(e, 'down_proj').bias for e in experts], dim=0) if hasattr(first_expert.down_proj, 'bias') and first_expert.down_proj.bias is not None else None
+                    
+                    # Batched matmul: (num_experts, hidden, in) @ (num_experts, in, n_tokens) -> (num_experts, hidden, n_tokens)
+                    gate_out = torch.bmm(gate_weights, moe_input.T.unsqueeze(0).expand(num_experts, -1, -1))
+                    up_out = torch.bmm(up_weights, moe_input.T.unsqueeze(0).expand(num_experts, -1, -1))
+                    
+                    if gate_bias is not None:
+                        gate_out = gate_out + gate_bias.unsqueeze(-1)
+                    if up_bias is not None:
+                        up_out = up_out + up_bias.unsqueeze(-1)
+                    
+                    # SwiGLU activation
+                    hidden = F.silu(gate_out) * up_out  # (num_experts, hidden, n_tokens)
+                    
+                    # Down projection
+                    down_out = torch.bmm(down_weights, hidden)  # (num_experts, out, n_tokens)
+                    if down_bias is not None:
+                        down_out = down_out + down_bias.unsqueeze(-1)
+                    
+                    expert_outs = down_out.transpose(1, 2)  # (num_experts, n_tokens, out)
+                    
+                elif has_up and has_down:
+                    # Simple MLP expert (up_proj, down_proj)
+                    up_weights = torch.stack([getattr(e, 'up_proj').weight for e in experts], dim=0)
+                    down_weights = torch.stack([getattr(e, 'down_proj').weight for e in experts], dim=0)
+                    
+                    up_bias = torch.stack([getattr(e, 'up_proj').bias for e in experts], dim=0) if hasattr(first_expert.up_proj, 'bias') and first_expert.up_proj.bias is not None else None
+                    down_bias = torch.stack([getattr(e, 'down_proj').bias for e in experts], dim=0) if hasattr(first_expert.down_proj, 'bias') and first_expert.down_proj.bias is not None else None
+                    
+                    up_out = torch.bmm(up_weights, moe_input.T.unsqueeze(0).expand(num_experts, -1, -1))
+                    if up_bias is not None:
+                        up_out = up_out + up_bias.unsqueeze(-1)
+                    
+                    hidden = F.silu(up_out)
+                    down_out = torch.bmm(down_weights, hidden)
+                    if down_bias is not None:
+                        down_out = down_out + down_bias.unsqueeze(-1)
+                    
+                    expert_outs = down_out.transpose(1, 2)
+                    
+                else:
+                    # Unknown structure - fall back to sequential
+                    raise ValueError("Unknown expert structure")
+                    
+            except Exception as e:
+                # Fall back to sequential for non-standard expert structures
+                logger.debug(f"Batched expert forward failed, using sequential: {e}")
+                expert_outs = torch.empty(
+                    num_experts, n_tokens, moe_input.shape[-1],
+                    device=device, dtype=moe_input.dtype
+                )
+                for i, expert in enumerate(experts):
+                    expert_outs[i] = expert(moe_input)
 
         # --- Online REAP score computation (fully GPU-resident) ---
         topk_indices = torch.topk(gate_probs, k=topk, dim=-1).indices
@@ -216,22 +285,44 @@ def collect_layer_data(
             sim_gate_logits_gpu.append(gate_probs[:n_keep, :].clone())
             sim_tokens_collected += n_keep
         
-        # Accumulate expert_hidden on GPU (capped per expert)
-        active_expert_indices = torch.where(expert_mask.any(dim=1))[0]
-        for i in active_expert_indices:
-            i = i.item()
-            expert_state = expert_outs[i, expert_mask[i]]
+        # Accumulate expert_hidden on GPU (capped per expert) - VECTORIZED
+        # Get all active (expert_idx, token_idx) pairs at once
+        active_positions = torch.nonzero(expert_mask)  # (n_active, 2) - (expert_idx, token_idx)
+        if active_positions.shape[0] > 0:
+            # Group positions by expert for efficient batched extraction
+            expert_ids = active_positions[:, 0]
+            token_ids = active_positions[:, 1]
             
-            if i not in expert_hidden_gpu:
-                n_to_take = min(expert_state.shape[0], max_hidden_tokens)
-                expert_hidden_gpu[i] = expert_state[:n_to_take].T.clone()
-            elif expert_hidden_gpu[i].shape[1] < max_hidden_tokens:
-                remaining = max_hidden_tokens - expert_hidden_gpu[i].shape[1]
-                if remaining > 0:
-                    n_to_take = min(expert_state.shape[0], remaining)
-                    expert_hidden_gpu[i] = torch.cat(
-                        [expert_hidden_gpu[i], expert_state[:n_to_take].T], dim=1
-                    )
+            # Sort by expert_id to group consecutive entries
+            sorted_indices = torch.argsort(expert_ids)
+            sorted_expert_ids = expert_ids[sorted_indices]
+            sorted_token_ids = token_ids[sorted_indices]
+            
+            # Find boundaries where expert_id changes
+            unique_experts, expert_counts = torch.unique_consecutive(sorted_expert_ids, return_counts=True)
+            
+            # Process each unique expert (still a loop but no .item() calls, all GPU ops)
+            offset = 0
+            for idx in range(unique_experts.shape[0]):
+                expert_i = unique_experts[idx].item()  # Single .item() per unique expert, not per token
+                count = expert_counts[idx].item()
+                
+                # Get all tokens for this expert at once
+                expert_token_indices = sorted_token_ids[offset:offset + count]
+                expert_state = expert_outs[expert_i, expert_token_indices]  # (n_tokens, hidden_dim)
+                
+                if expert_i not in expert_hidden_gpu:
+                    n_to_take = min(expert_state.shape[0], max_hidden_tokens)
+                    expert_hidden_gpu[expert_i] = expert_state[:n_to_take].T.clone()
+                elif expert_hidden_gpu[expert_i].shape[1] < max_hidden_tokens:
+                    remaining = max_hidden_tokens - expert_hidden_gpu[expert_i].shape[1]
+                    if remaining > 0:
+                        n_to_take = min(expert_state.shape[0], remaining)
+                        expert_hidden_gpu[expert_i] = torch.cat(
+                            [expert_hidden_gpu[expert_i], expert_state[:n_to_take].T], dim=1
+                        )
+                
+                offset += count
         
         total_tokens += n_tokens
 
