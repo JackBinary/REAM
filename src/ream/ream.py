@@ -86,6 +86,9 @@ def collect_layer_data(
     Only a capped reservoir of tokens is kept for the similarity matrix used
     during clustering, and expert_hidden is capped per expert.
 
+    GPU-optimized: Minimizes CPU-GPU synchronization by batching transfers
+    and keeping computations on GPU as long as possible.
+
     Args:
         max_sim_tokens: Maximum tokens to retain for the gated-similarity matrix.
             4096 is plenty for accurate cosine similarity estimation.
@@ -99,6 +102,8 @@ def collect_layer_data(
       - expert_hidden: dict[int, (d, <=max_hidden_tokens)] hidden activations per expert
       - expert_frequency: (N,) how often each expert is selected
     """
+    import numpy as np
+    
     moe = get_moe(model, layer_idx)
     experts = getattr(moe, model_attrs["experts"])
     router = getattr(moe, model_attrs["router"])
@@ -110,22 +115,19 @@ def collect_layer_data(
     cfg = getattr(model.config, "text_config", model.config)
     topk = getattr(cfg, topk_key, 8)
 
-    # --- Online accumulators for REAP scores (keep on GPU as long as possible) ---
-    reap_numer = torch.zeros(num_experts, device=device)   # running sum of (norm * gate_val)
-    reap_denom = torch.zeros(num_experts, device=device)   # running count of routed tokens
-    expert_frequency = torch.zeros(num_experts, device=device)
-    expert_hidden: dict[int, torch.Tensor] = {}
+    # --- Online accumulators for REAP scores (keep on GPU) ---
+    reap_numer = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    reap_denom = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    expert_frequency = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    
+    # --- GPU buffers for expert_hidden (accumulate on GPU, transfer once at end) ---
+    expert_hidden_gpu: dict[int, torch.Tensor] = {}
 
-    # --- Capped reservoir for similarity computation ---
-    # Pre-allocate lists with expected capacity to reduce reallocations
-    sim_expert_outputs: list[torch.Tensor] = []
-    sim_gate_logits: list[torch.Tensor] = []
+    # --- GPU buffers for similarity data (accumulate on GPU, transfer once at end) ---
+    sim_expert_outputs_gpu: list[torch.Tensor] = []
+    sim_gate_logits_gpu: list[torch.Tensor] = []
     sim_tokens_collected = 0
     total_tokens = 0
-    
-    # Pre-compute batch sizes for more efficient memory management
-    expected_batches = len(calibration_inputs)
-    avg_batch_size = 512  # Estimate, adjust based on your data
 
     # Hook to capture the input to the MoE block
     captured = {}
@@ -138,18 +140,14 @@ def collect_layer_data(
 
     logger.info(f"Collecting data for layer {layer_idx}: processing {len(calibration_inputs)} calibration batches")
     
-    # Process in larger chunks to reduce CPU overhead
-    batch_chunk_size = 4  # Process 4 batches before CPU synchronization
-    batch_chunk = []
-    
     for batch_idx, batch_input in enumerate(tqdm(calibration_inputs, desc=f"Layer {layer_idx} forward passes", leave=False)):
         if isinstance(batch_input, torch.Tensor):
-            inputs = batch_input.to(device)
+            inputs = batch_input.to(device, non_blocking=True)
             if inputs.dim() == 1:
                 inputs = inputs.unsqueeze(0)
             model_input = {"input_ids": inputs}
         elif isinstance(batch_input, dict):
-            model_input = {k: v.to(device) for k, v in batch_input.items()}
+            model_input = {k: v.to(device, non_blocking=True) for k, v in batch_input.items()}
         else:
             continue
 
@@ -169,41 +167,34 @@ def collect_layer_data(
         n_tokens = moe_input.shape[0]
 
         # Compute gate logits manually
-        with torch.no_grad():
-            gate_out = router(moe_input)  # (n_tokens, N)
-            # Some routers (e.g. Qwen3.5) return a tuple (logits, scores, indices)
-            if isinstance(gate_out, tuple):
-                gate_out = gate_out[0]
-            gate_probs = F.softmax(gate_out, dim=-1)
+        gate_out = router(moe_input)  # (n_tokens, N)
+        # Some routers (e.g. Qwen3.5) return a tuple (logits, scores, indices)
+        if isinstance(gate_out, tuple):
+            gate_out = gate_out[0]
+        gate_probs = F.softmax(gate_out, dim=-1)
 
-        # Compute expert outputs for all experts - optimized batch computation
-        expert_outs = torch.zeros(
+        # Compute expert outputs for all experts
+        expert_outs = torch.empty(
             num_experts, n_tokens, moe_input.shape[-1],
             device=device, dtype=moe_input.dtype
         )
         
         if is_fused:
-            # For fused experts, we need to compute sequentially but can still optimize
+            # For fused experts, compute sequentially
             for i in range(num_experts):
                 expert_outs[i] = fused_expert_forward(experts, i, moe_input)
         else:
-            # For non-fused experts, we can compute in parallel using vmap or manual batching
-            # Since experts are separate modules, we need to compute sequentially
-            # but we can at least keep everything on GPU
+            # For non-fused experts, compute sequentially but keep on GPU
             for i, expert in enumerate(experts):
                 expert_outs[i] = expert(moe_input)
 
-        # Keep computations on GPU as much as possible
-        # --- Online REAP score computation (GPU optimized) ---
-        topk_values, topk_indices = torch.topk(gate_probs, k=topk, dim=-1)
+        # --- Online REAP score computation (fully GPU-resident) ---
+        topk_indices = torch.topk(gate_probs, k=topk, dim=-1).indices
         
-        # Create mask for each expert (num_experts, n_tokens) on GPU - vectorized
-        # Expand topk_indices for comparison with all experts
-        topk_expanded = topk_indices.unsqueeze(0).expand(num_experts, -1, -1)  # (num_experts, n_tokens, topk)
-        expert_range = torch.arange(num_experts, device=device).view(-1, 1, 1)  # (num_experts, 1, 1)
-        expert_mask = (topk_expanded == expert_range).any(dim=-1)  # (num_experts, n_tokens)
+        # Vectorized mask creation using broadcasting
+        expert_mask = (topk_indices.unsqueeze(0) == torch.arange(num_experts, device=device).view(-1, 1, 1)).any(dim=-1)
         
-        # Compute counts and REAP scores on GPU (keep everything on GPU)
+        # Compute counts and REAP scores on GPU
         counts = expert_mask.sum(dim=1).float()
         expert_frequency += counts
         
@@ -211,58 +202,42 @@ def collect_layer_data(
         norms = expert_outs.norm(dim=-1)  # (num_experts, n_tokens)
         
         # Compute REAP numerator contributions on GPU - vectorized
-        # Multiply norms with gate_probs (transposed) and mask
         gate_probs_t = gate_probs.T  # (num_experts, n_tokens)
-        weighted_norms = norms * gate_probs_t  # (num_experts, n_tokens)
-        # Apply mask and sum
+        weighted_norms = norms * gate_probs_t
         reap_contributions = (weighted_norms * expert_mask.float()).sum(dim=1)
         
         reap_numer += reap_contributions
         reap_denom += counts
         
-        # --- Keep a capped reservoir for similarity matrix ---
+        # --- Keep a capped reservoir for similarity matrix (GPU buffers) ---
         if sim_tokens_collected < max_sim_tokens:
             n_keep = min(n_tokens, max_sim_tokens - sim_tokens_collected)
-            # Only move the needed slice to CPU
-            sim_expert_outputs.append(expert_outs[:, :n_keep, :].cpu())
-            sim_gate_logits.append(gate_probs[:n_keep, :].cpu())
+            sim_expert_outputs_gpu.append(expert_outs[:, :n_keep, :].clone())
+            sim_gate_logits_gpu.append(gate_probs[:n_keep, :].clone())
             sim_tokens_collected += n_keep
         
-        # Accumulate expert_hidden (capped per expert) - optimized GPU→CPU transfer
-        # Process experts in batches to reduce Python loop overhead
+        # Accumulate expert_hidden on GPU (capped per expert)
         active_expert_indices = torch.where(expert_mask.any(dim=1))[0]
         for i in active_expert_indices:
             i = i.item()
-            # Get expert outputs for this expert (still on GPU)
-            expert_state_gpu = expert_outs[i, expert_mask[i]]
+            expert_state = expert_outs[i, expert_mask[i]]
             
-            # Move only the needed amount to CPU
-            if i not in expert_hidden:
-                # Take first max_hidden_tokens tokens
-                n_to_take = min(expert_state_gpu.shape[0], max_hidden_tokens)
-                expert_hidden[i] = expert_state_gpu[:n_to_take].T.cpu()
-            elif expert_hidden[i].shape[1] < max_hidden_tokens:
-                remaining = max_hidden_tokens - expert_hidden[i].shape[1]
+            if i not in expert_hidden_gpu:
+                n_to_take = min(expert_state.shape[0], max_hidden_tokens)
+                expert_hidden_gpu[i] = expert_state[:n_to_take].T.clone()
+            elif expert_hidden_gpu[i].shape[1] < max_hidden_tokens:
+                remaining = max_hidden_tokens - expert_hidden_gpu[i].shape[1]
                 if remaining > 0:
-                    n_to_take = min(expert_state_gpu.shape[0], remaining)
-                    expert_hidden[i] = torch.cat(
-                        [expert_hidden[i], expert_state_gpu[:n_to_take].T.cpu()], dim=1
+                    n_to_take = min(expert_state.shape[0], remaining)
+                    expert_hidden_gpu[i] = torch.cat(
+                        [expert_hidden_gpu[i], expert_state[:n_to_take].T], dim=1
                     )
-        
-        # Clean up GPU memory - batch deletions to reduce CPU overhead
-        del expert_outs, expert_mask, norms, reap_contributions, gate_probs_t, weighted_norms
-        if 'expert_state_gpu' in locals():
-            del expert_state_gpu
-        if 'topk_expanded' in locals():
-            del topk_expanded
-        if 'expert_range' in locals():
-            del expert_range
         
         total_tokens += n_tokens
 
     hook.remove()
 
-    if not sim_expert_outputs:
+    if not sim_expert_outputs_gpu:
         raise RuntimeError(
             f"No data collected for layer {layer_idx}. "
             "Check that calibration data flows through the model correctly."
@@ -271,29 +246,25 @@ def collect_layer_data(
     # Finalize REAP scores: mean = sum / count
     reap_scores = reap_numer / (reap_denom + 1e-8)
 
-    # Concatenate the capped reservoir - use pre-allocated tensor if possible
-    expert_outputs = torch.cat(sim_expert_outputs, dim=1)
-    gate_logits = torch.cat(sim_gate_logits, dim=0)
+    # Single batch transfer to CPU at the end (much more efficient)
+    expert_outputs = torch.cat(sim_expert_outputs_gpu, dim=1).cpu()
+    gate_logits = torch.cat(sim_gate_logits_gpu, dim=0).cpu()
+    
+    # Transfer expert_hidden to CPU in one batch
+    expert_hidden = {k: v.cpu() for k, v in expert_hidden_gpu.items()}
+    
+    # Free GPU memory
+    del sim_expert_outputs_gpu, sim_gate_logits_gpu, expert_hidden_gpu
+    torch.cuda.empty_cache()
 
-    # Calculate some statistics - use NumPy if available for faster CPU operations
-    if use_numpy:
-        # Convert to NumPy arrays for faster CPU operations
-        expert_freq_np = expert_frequency.cpu().numpy()
-        reap_scores_np = reap_scores.cpu().numpy()
-        
-        active_experts = np.sum(expert_freq_np > 0)
-        avg_reap_score = float(np.mean(reap_scores_np))
-        max_reap_score = float(np.max(reap_scores_np))
-        if active_experts > 0:
-            min_reap_score = float(np.min(reap_scores_np[expert_freq_np > 0]))
-        else:
-            min_reap_score = 0.0
-    else:
-        # Fall back to PyTorch
-        active_experts = (expert_frequency > 0).sum().item()
-        avg_reap_score = reap_scores.mean().item()
-        max_reap_score = reap_scores.max().item()
-        min_reap_score = reap_scores[expert_frequency > 0].min().item() if (expert_frequency > 0).any() else 0
+    # Calculate statistics using NumPy for faster CPU operations
+    expert_freq_np = expert_frequency.cpu().numpy()
+    reap_scores_np = reap_scores.cpu().numpy()
+    
+    active_experts = int(np.sum(expert_freq_np > 0))
+    avg_reap_score = float(np.mean(reap_scores_np))
+    max_reap_score = float(np.max(reap_scores_np))
+    min_reap_score = float(np.min(reap_scores_np[expert_freq_np > 0])) if active_experts > 0 else 0.0
     
     logger.info(f"Layer {layer_idx}: Data collection complete!")
     logger.info(f"  Processed {int(total_tokens)} tokens total")
