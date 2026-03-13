@@ -544,7 +544,7 @@ def ream_sequential_merge(
 
 
 # ---------------------------------------------------------------------------
-# Calibration data loading (mixed: c4 + math + coding)
+# Calibration data loading (mixed: c4 + math + coding + roleplay)
 # ---------------------------------------------------------------------------
 
 def load_ream_calibration_data(
@@ -556,6 +556,7 @@ def load_ream_calibration_data(
     c4_max_tokens: int = 128,
     math_max_tokens: int = 512,
     code_max_tokens: int = 512,
+    roleplay_max_tokens: int = 512,
     seed: int = 42,
 ) -> list[torch.Tensor]:
     """
@@ -639,6 +640,24 @@ def load_ream_calibration_data(
         logger.info(f"Loaded {len(code_indices)} code samples")
     except Exception as e:
         logger.warning(f"Failed to load the-stack-smol data: {e}. Skipping.")
+
+    # 4. Creative/Roleplay (bluemoon_roleplay_chat_data - 300k roleplay messages)
+    logger.info("Loading roleplay/creative writing calibration data...")
+    try:
+        roleplay_ds = load_dataset(
+            "rickRossie/bluemoon_roleplay_chat_data_300k_messages",
+            split="train",
+            streaming=False,
+            trust_remote_code=True,
+        )
+        roleplay_indices = random.sample(range(len(code_ds)), min(code_samples, len(code_ds)))
+        for idx in roleplay_indices:
+            text = roleplay_ds[idx].get("message", "")
+            tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=roleplay_max_tokens)
+            all_inputs.append(tokens["input_ids"])
+        logger.info(f"Loaded {len(roleplay_indices)} code samples")
+    except Exception as e:
+        logger.warning(f"Failed to load roleplay data: {e}. Skipping.")
 
     if not all_inputs:
         raise RuntimeError("No calibration data loaded. Check dataset availability.")
