@@ -650,6 +650,7 @@ def load_ream_calibration_data(
     c4_samples: int = 512,
     math_samples: int = 1024,
     code_samples: int = 512,
+    roleplay_samples: int = 512,
     c4_max_tokens: int = 128,
     math_max_tokens: int = 512,
     code_max_tokens: int = 512,
@@ -751,7 +752,7 @@ def load_ream_calibration_data(
             streaming=False,
             trust_remote_code=True,
         )
-        roleplay_indices = random.sample(range(len(roleplay_ds)), min(code_samples, len(roleplay_ds)))
+        roleplay_indices = random.sample(range(len(roleplay_ds)), min(roleplay_samples, len(roleplay_ds)))
         for idx in roleplay_indices:
             text = roleplay_ds[idx].get("message", "")
             tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=roleplay_max_tokens)
