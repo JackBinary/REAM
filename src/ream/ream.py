@@ -650,12 +650,12 @@ def load_ream_calibration_data(
             streaming=False,
             trust_remote_code=True,
         )
-        roleplay_indices = random.sample(range(len(code_ds)), min(code_samples, len(code_ds)))
+        roleplay_indices = random.sample(range(len(roleplay_ds)), min(code_samples, len(roleplay_ds)))
         for idx in roleplay_indices:
             text = roleplay_ds[idx].get("message", "")
             tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=roleplay_max_tokens)
             all_inputs.append(tokens["input_ids"])
-        logger.info(f"Loaded {len(roleplay_indices)} code samples")
+        logger.info(f"Loaded {len(roleplay_indices)} roleplay samples")
     except Exception as e:
         logger.warning(f"Failed to load roleplay data: {e}. Skipping.")
 
