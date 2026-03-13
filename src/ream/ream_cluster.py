@@ -77,12 +77,40 @@ def compute_gated_similarity_matrix(
     Returns:
         (N, N) similarity matrix
     """
+    logger.info(f"Computing {num_experts}x{num_experts} gated similarity matrix...")
+    logger.info(f"  Expert outputs shape: {expert_outputs.shape}")
+    logger.info(f"  Gate logits shape: {gate_logits.shape}")
+    
     sim_matrix = torch.zeros(num_experts, num_experts)
+    total_pairs = num_experts * (num_experts - 1) // 2
+    logger.info(f"  Total expert pairs to compare: {total_pairs}")
+    
+    # Show progress for large matrices
+    if total_pairs > 100:
+        from tqdm import tqdm
+        pbar = tqdm(total=total_pairs, desc="Computing similarities", leave=False)
+    
+    pair_count = 0
     for i in range(num_experts):
         for j in range(i + 1, num_experts):
             s = gated_similarity(expert_outputs, gate_logits, i, j)
             sim_matrix[i, j] = s
             sim_matrix[j, i] = s
+            pair_count += 1
+            
+            if total_pairs > 100 and pair_count % 100 == 0:
+                pbar.update(100)
+    
+    if total_pairs > 100:
+        pbar.close()
+    
+    # Compute some statistics
+    avg_sim = sim_matrix.mean().item()
+    max_sim = sim_matrix.max().item()
+    min_sim = sim_matrix[sim_matrix > 0].min().item() if (sim_matrix > 0).any() else 0
+    
+    logger.info(f"  Similarity matrix computed: avg={avg_sim:.4f}, max={max_sim:.4f}, min={min_sim:.4f}")
+    
     return sim_matrix
 
 
@@ -124,6 +152,7 @@ def ream_clustering(
     )
 
     # Step 1: Pick k centroids with highest REAP scores
+    logger.info(f"Selecting {num_clusters} centroids from {num_experts} experts...")
     _, centroid_indices = torch.topk(reap_scores, num_clusters)
     centroid_indices = centroid_indices.tolist()
 
@@ -131,6 +160,13 @@ def ream_clustering(
     centroid_indices = sorted(
         centroid_indices, key=lambda idx: reap_scores[idx].item(), reverse=True
     )
+    
+    # Log centroid REAP scores
+    logger.info(f"Centroids selected (expert indices): {centroid_indices}")
+    for i, idx in enumerate(centroid_indices[:5]):  # Show first 5
+        logger.info(f"  Centroid {i}: expert {idx}, REAP score: {reap_scores[idx]:.4f}")
+    if len(centroid_indices) > 5:
+        logger.info(f"  ... and {len(centroid_indices) - 5} more centroids")
 
     # Step 2: Compute gated similarity matrix
     logger.info("Computing gated similarity matrix...")
@@ -139,6 +175,7 @@ def ream_clustering(
     )
 
     # Step 3: Pseudo-pruning grouping
+    logger.info(f"Starting pseudo-pruning grouping (max cluster size: {max_cluster_size})...")
     labels = torch.full((num_experts,), -1, dtype=torch.long)
 
     # Assign each centroid to its own cluster
@@ -152,6 +189,9 @@ def ream_clustering(
     total_non_centroid = num_experts - num_clusters
     # Each centroid can absorb at most (max_cluster_size - 1) non-centroids
     budget_per_centroid = max_cluster_size - 1
+    
+    logger.info(f"Total non-centroid experts to assign: {total_non_centroid}")
+    logger.info(f"Budget per centroid: {budget_per_centroid} non-centroids")
 
     for cluster_id, centroid_idx in enumerate(centroid_indices):
         if not unassigned:
@@ -164,11 +204,22 @@ def ream_clustering(
 
         if num_to_assign > 0:
             _, top_indices = torch.topk(sims, num_to_assign)
+            assigned_this_centroid = []
             for idx in top_indices:
                 expert_idx = unassigned_list[idx.item()]
                 labels[expert_idx] = cluster_id
                 assigned.add(expert_idx)
                 unassigned.discard(expert_idx)
+                assigned_this_centroid.append(expert_idx)
+            
+            if assigned_this_centroid:
+                logger.info(f"  Centroid {cluster_id} (expert {centroid_idx}): assigned {len(assigned_this_centroid)} experts")
+                if len(assigned_this_centroid) <= 5:
+                    logger.info(f"    Assigned experts: {assigned_this_centroid}")
+                else:
+                    logger.info(f"    Assigned experts: {assigned_this_centroid[:5]}... and {len(assigned_this_centroid)-5} more")
+        else:
+            logger.info(f"  Centroid {cluster_id} (expert {centroid_idx}): no experts assigned (budget exhausted or no unassigned experts)")
 
     # Any remaining unassigned experts get assigned to the nearest centroid
     if unassigned:
@@ -185,6 +236,19 @@ def ream_clustering(
                     best_sim = s
                     best_cluster = cluster_id
             labels[expert_idx] = best_cluster
+
+    # Calculate cluster statistics
+    cluster_sizes = []
+    for cluster_id in range(num_clusters):
+        size = (labels == cluster_id).sum().item()
+        cluster_sizes.append(size)
+    
+    logger.info(f"Clustering complete!")
+    logger.info(f"  Cluster sizes: {cluster_sizes}")
+    logger.info(f"  Average cluster size: {sum(cluster_sizes)/len(cluster_sizes):.2f}")
+    logger.info(f"  Max cluster size: {max(cluster_sizes)}")
+    logger.info(f"  Min cluster size: {min(cluster_sizes)}")
+    logger.info(f"  Clusters with size > 1: {sum(1 for s in cluster_sizes if s > 1)}")
 
     return labels
 

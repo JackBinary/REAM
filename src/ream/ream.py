@@ -131,7 +131,9 @@ def collect_layer_data(
 
     hook = moe.register_forward_hook(capture_moe_input)
 
-    for batch_input in calibration_inputs:
+    logger.info(f"Collecting data for layer {layer_idx}: processing {len(calibration_inputs)} calibration batches")
+    
+    for batch_idx, batch_input in enumerate(tqdm(calibration_inputs, desc=f"Layer {layer_idx} forward passes", leave=False)):
         if isinstance(batch_input, torch.Tensor):
             inputs = batch_input.to(device)
             if inputs.dim() == 1:
@@ -146,7 +148,7 @@ def collect_layer_data(
         try:
             _ = model(**model_input)
         except Exception as e:
-            logger.warning(f"Forward pass failed for batch: {e}")
+            logger.warning(f"Forward pass failed for batch {batch_idx}: {e}")
             continue
 
         if "moe_input" not in captured:
@@ -230,10 +232,18 @@ def collect_layer_data(
     expert_outputs = torch.cat(sim_expert_outputs, dim=1)
     gate_logits = torch.cat(sim_gate_logits, dim=0)
 
-    logger.info(
-        f"Layer {layer_idx}: collected REAP scores over {int(total_tokens)} tokens, "
-        f"similarity reservoir {expert_outputs.shape[1]} tokens"
-    )
+    # Calculate some statistics
+    active_experts = (expert_frequency > 0).sum().item()
+    avg_reap_score = reap_scores.mean().item()
+    max_reap_score = reap_scores.max().item()
+    min_reap_score = reap_scores[expert_frequency > 0].min().item() if (expert_frequency > 0).any() else 0
+    
+    logger.info(f"Layer {layer_idx}: Data collection complete!")
+    logger.info(f"  Processed {int(total_tokens)} tokens total")
+    logger.info(f"  Similarity reservoir: {expert_outputs.shape[1]} tokens")
+    logger.info(f"  Active experts: {active_experts}/{num_experts}")
+    logger.info(f"  REAP scores: avg={avg_reap_score:.4f}, max={max_reap_score:.4f}, min={min_reap_score:.4f}")
+    logger.info(f"  Hidden activations collected for {len(expert_hidden)} experts")
 
     return {
         "reap_scores": reap_scores,
@@ -336,6 +346,8 @@ def ream_merge_layer(
     logger.info(f"Layer {layer_idx}: Merging {num_experts} -> {num_clusters} experts")
 
     # Step 1: REAM clustering
+    logger.info(f"Step 1: Running REAM clustering...")
+    start_time = time.time()
     cluster_labels = ream_clustering(
         reap_scores=reap_scores,
         expert_outputs=expert_outputs,
@@ -344,14 +356,19 @@ def ream_merge_layer(
         num_clusters=num_clusters,
         max_cluster_size=max_cluster_size,
     )
+    cluster_time = time.time() - start_time
+    logger.info(f"Clustering completed in {cluster_time:.2f}s")
 
     # Identify centroids (the expert with highest REAP score in each cluster)
+    logger.info(f"Step 2: Identifying centroids...")
     centroid_indices = []
     for cluster_id in cluster_labels.unique():
         experts_in_cluster = torch.where(cluster_labels == cluster_id)[0]
         cluster_reap = reap_scores[experts_in_cluster]
         centroid_local = torch.argmax(cluster_reap)
-        centroid_indices.append(experts_in_cluster[centroid_local].item())
+        centroid_idx = experts_in_cluster[centroid_local].item()
+        centroid_indices.append(centroid_idx)
+        logger.info(f"  Cluster {cluster_id.item()}: {len(experts_in_cluster)} experts, centroid = expert {centroid_idx} (REAP score: {reap_scores[centroid_idx]:.4f})")
 
     # Compute expert probabilities from REAP scores (for weighted merge)
     expert_proba = reap_scores / (reap_scores.sum() + 1e-8)
@@ -359,11 +376,13 @@ def ream_merge_layer(
     moe = get_moe(model, layer_idx)
 
     # Step 2 & 3: Merge with permutation alignment
+    logger.info(f"Step 3: Aligning and merging experts...")
     is_fused = model_attrs.get("fused", False)
     if is_fused and use_activation_weight_permute:
         # ActivationWeightPermuter doesn't support fused experts; fall back to wm
         logger.info("Fused experts detected — using weight-matching permuter instead of activation+weight")
     permute_method = "activation_weight" if (use_activation_weight_permute and not is_fused) else "wm"
+    logger.info(f"Using permutation method: {permute_method}")
 
     # For activation_weight permuter, we need to pass hidden activations
     if permute_method == "activation_weight":
@@ -381,13 +400,18 @@ def ream_merge_layer(
 
         # Manually handle permutation with activation+weight alignment
         experts = getattr(moe, model_attrs["experts"])
+        logger.info(f"Running activation+weight permutation for {len(cluster_labels.unique())} clusters...")
+        permute_start = time.time()
+        
         for cluster_id in cluster_labels.unique():
             expert_indices = torch.where(cluster_labels == cluster_id)[0].tolist()
             if len(expert_indices) <= 1:
+                logger.info(f"  Cluster {cluster_id.item()}: {len(expert_indices)} expert (skipping permutation)")
                 continue
 
             # Find dominant expert (highest REAP score in cluster)
             dom_expert = max(expert_indices, key=lambda idx: reap_scores[idx].item())
+            logger.info(f"  Cluster {cluster_id.item()}: aligning {len(expert_indices)} experts to centroid {dom_expert}")
 
             # Build hidden activation dict for this cluster
             cluster_hidden = {}
@@ -402,9 +426,18 @@ def ream_merge_layer(
             )
             permuter.permute(experts, expert_indices, dom_expert_idx=dom_expert)
 
+        permute_time = time.time() - permute_start
+        logger.info(f"Permutation completed in {permute_time:.2f}s")
+
         # Now run the merge (without permutation since we already did it)
+        logger.info("Merging aligned experts...")
+        merge_start = time.time()
         merger.merge_experts()
+        merge_time = time.time() - merge_start
+        logger.info(f"Merging completed in {merge_time:.2f}s")
     else:
+        logger.info(f"Running weight-matching permutation and merge...")
+        merge_start = time.time()
         merger = MoEExpertMerger(
             moe=moe,
             cluster_label=cluster_labels,
@@ -416,14 +449,24 @@ def ream_merge_layer(
             tie_tensors=False,
         )
         merger.merge_experts()
+        merge_time = time.time() - merge_start
+        logger.info(f"Permutation and merging completed in {merge_time:.2f}s")
 
     # Step 4: Prune gate weights
     if prune_gate:
+        logger.info("Step 4: Pruning gate weights...")
+        prune_start = time.time()
         prune_gate_weights(moe, centroid_indices, model_attrs)
+        prune_time = time.time() - prune_start
+        logger.info(f"Gate pruning completed in {prune_time:.2f}s")
 
-    logger.info(f"Layer {layer_idx}: Merge complete. Cluster sizes: "
-                f"{[int((cluster_labels == c).sum()) for c in cluster_labels.unique()]}")
-
+    # Calculate cluster distribution
+    cluster_sizes = [int((cluster_labels == c).sum()) for c in cluster_labels.unique()]
+    logger.info(f"Layer {layer_idx}: Merge complete!")
+    logger.info(f"  Cluster distribution: {cluster_sizes}")
+    logger.info(f"  Total experts merged: {num_experts} -> {num_clusters}")
+    logger.info(f"  Centroids: {sorted(centroid_indices)}")
+    
     return cluster_labels, centroid_indices
 
 
@@ -502,12 +545,16 @@ def ream_sequential_merge(
         logger.info(f"Skipping last MoE layer {layers_to_process[-1]}")
         layers_to_process = layers_to_process[:-1]
 
+    layer_start_time = time.time()
     for layer_idx in tqdm(layers_to_process, desc="REAM sequential merge"):
+        layer_iter_start = time.time()
         logger.info(f"\n{'='*60}")
         logger.info(f"Processing MoE layer {layer_idx}")
         logger.info(f"{'='*60}")
 
         # Collect fresh activations through the (possibly already merged) model
+        logger.info(f"Starting data collection for layer {layer_idx}...")
+        data_start = time.time()
         layer_data = collect_layer_data(
             model=model,
             calibration_inputs=calibration_inputs,
@@ -515,8 +562,12 @@ def ream_sequential_merge(
             model_attrs=model_attrs,
             device=device,
         )
+        data_time = time.time() - data_start
+        logger.info(f"Data collection completed in {data_time:.2f}s")
 
         # Run REAM merge for this layer
+        logger.info(f"Starting REAM merge for layer {layer_idx}...")
+        merge_start = time.time()
         cluster_labels, centroid_indices = ream_merge_layer(
             model=model,
             layer_idx=layer_idx,
@@ -528,6 +579,7 @@ def ream_sequential_merge(
             use_activation_weight_permute=use_activation_weight_permute,
             prune_gate=prune_gate,
         )
+        merge_time = time.time() - merge_start
 
         all_cluster_labels[layer_idx] = cluster_labels
         all_centroid_indices[layer_idx] = centroid_indices
@@ -536,6 +588,17 @@ def ream_sequential_merge(
         del layer_data
         gc.collect()
         torch.cuda.empty_cache()
+        
+        layer_iter_time = time.time() - layer_iter_start
+        logger.info(f"Layer {layer_idx} completed in {layer_iter_time:.2f}s (data: {data_time:.2f}s, merge: {merge_time:.2f}s)")
+        logger.info(f"{'='*60}")
+    
+    total_time = time.time() - layer_start_time
+    logger.info(f"\n{'='*60}")
+    logger.info(f"REAM sequential merge completed!")
+    logger.info(f"Total time: {total_time:.2f}s")
+    logger.info(f"Processed {len(layers_to_process)} MoE layers")
+    logger.info(f"{'='*60}")
 
     return {
         "cluster_labels": all_cluster_labels,
@@ -584,6 +647,10 @@ def load_ream_calibration_data(
     import random
     random.seed(seed)
     torch.manual_seed(seed)
+    
+    logger.info(f"Loading REAM mixed calibration data with seed {seed}...")
+    logger.info(f"Dataset mix: C4={c4_samples}, Math={math_samples}, Code={code_samples}")
+    logger.info(f"Token limits: C4={c4_max_tokens}, Math={math_max_tokens}, Code={code_max_tokens}")
 
     all_inputs = []
 
@@ -664,7 +731,17 @@ def load_ream_calibration_data(
 
     # Shuffle
     random.shuffle(all_inputs)
-    logger.info(f"Total calibration samples: {len(all_inputs)}")
+    
+    # Calculate total tokens
+    total_tokens = sum(input_ids.shape[1] for input_ids in all_inputs)
+    avg_tokens = total_tokens / len(all_inputs) if all_inputs else 0
+    
+    logger.info(f"Calibration data loading complete!")
+    logger.info(f"  Total samples: {len(all_inputs)}")
+    logger.info(f"  Total tokens: {total_tokens}")
+    logger.info(f"  Average tokens per sample: {avg_tokens:.1f}")
+    logger.info(f"  Sample shape example: {all_inputs[0].shape if all_inputs else 'N/A'}")
+    
     return all_inputs
 
 
@@ -698,16 +775,24 @@ def main():
     results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
 
     # Load model
+    logger.info(f"Loading model: {model_args.model_name}")
     model_name = patched_model_map(model_args.model_name)
+    logger.info(f"Loading tokenizer from {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    logger.info(f"Loading model from {model_name}...")
+    model_start = time.time()
     model = load_model_text_only(
         model_name,
         device_map="auto",
         torch_dtype="auto",
         trust_remote_code=True,
     )
-
+    model_time = time.time() - model_start
+    logger.info(f"Model loaded in {model_time:.2f}s")
+    
     model_attrs = MODEL_ATTRS[model.__class__.__name__]
+    logger.info(f"Model class: {model.__class__.__name__}")
+    logger.info(f"Model attributes: {model_attrs}")
 
     # Load calibration data
     logger.info("Loading REAM mixed calibration data...")
@@ -740,20 +825,35 @@ def main():
             calibration_inputs.extend(cat_data)
 
     # Compute num_clusters
+    logger.info("Analyzing model structure...")
     experts_sample = getattr(get_moe(model, 0), model_attrs["experts"])
     num_experts_sample = get_num_experts(experts_sample, model_attrs)
+    logger.info(f"Found {num_experts_sample} experts per MoE layer")
+    
     num_clusters = cluster_args.num_clusters
     if num_clusters is None:
         if cluster_args.compression_ratio is None:
             raise ValueError("Either num_clusters or compression_ratio must be set.")
         num_clusters = int(num_experts_sample * (1 - cluster_args.compression_ratio))
+        logger.info(f"Using compression ratio {cluster_args.compression_ratio} -> {num_clusters} clusters")
 
     max_cluster_size = cluster_args.max_cluster_size or 16
 
-    logger.info(f"REAM config: {num_experts_sample} -> {num_clusters} experts, "
-                f"max_cluster_size={max_cluster_size}")
+    logger.info(f"REAM configuration:")
+    logger.info(f"  Original experts per layer: {num_experts_sample}")
+    logger.info(f"  Target clusters per layer: {num_clusters}")
+    logger.info(f"  Compression: {num_experts_sample} -> {num_clusters} ({(1 - num_clusters/num_experts_sample)*100:.1f}% reduction)")
+    logger.info(f"  Max cluster size: {max_cluster_size}")
+    logger.info(f"  Merge method: {merge_args.merge_method}")
+    logger.info(f"  Permutation method: {'activation+weight' if merge_args.permute != 'wm' else 'weight-matching'}")
+    logger.info(f"  Skip first layer: {merge_args.skip_first}")
+    logger.info(f"  Skip last layer: {merge_args.skip_last}")
 
     # Run REAM sequential merge
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Starting REAM sequential merge pipeline")
+    logger.info(f"{'='*60}")
+    merge_start = time.time()
     result = ream_sequential_merge(
         model=model,
         tokenizer=tokenizer,
@@ -766,10 +866,15 @@ def main():
         skip_first=merge_args.skip_first,
         skip_last=merge_args.skip_last,
     )
+    merge_total_time = time.time() - merge_start
+    logger.info(f"\n{'='*60}")
+    logger.info(f"REAM merge pipeline completed in {merge_total_time:.2f}s")
+    logger.info(f"{'='*60}")
 
     cluster_labels = result["cluster_labels"]
 
     # Save model
+    logger.info(f"\nSaving merged model...")
     merged_model_dir = get_model_dir(
         results_dir,
         num_clusters,
@@ -778,18 +883,24 @@ def main():
         obs_args,
         merge_args,
     )
+    logger.info(f"Model will be saved to: {merged_model_dir}")
 
+    save_start = time.time()
     merged_model_dir = save_merged_model(
         model, tokenizer, merged_model_dir, safe_serialization=True
     )
+    save_time = time.time() - save_start
+    logger.info(f"Model saved in {save_time:.2f}s")
 
     # Save clustering info
+    logger.info("Saving clustering information...")
     cluster_analysis_dir = merged_model_dir / "clusters"
     cluster_analysis_dir.mkdir(parents=True, exist_ok=True)
     with open(cluster_analysis_dir / "clusters.pkl", "wb") as f:
         pickle.dump(cluster_labels, f)
     with open(cluster_analysis_dir / "centroids.pkl", "wb") as f:
         pickle.dump(result["centroid_indices"], f)
+    logger.info(f"Clustering info saved to {cluster_analysis_dir}")
 
     # Smoke test
     if reap_args.smoke_test:
