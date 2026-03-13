@@ -643,15 +643,19 @@ def collect_layer_data(
     gpus_to_use = available_gpus[:num_gpus]
     logger.info(f"Using {len(gpus_to_use)} GPUs in parallel: {gpus_to_use}")
     
-    # Move model to CPU to free GPU memory before spawning workers
-    # Each worker will load its own copy on its assigned GPU
-    logger.info("Moving model to CPU to free GPU memory for workers...")
+    # For multi-GPU mode, the main process keeps the model on CPU.
+    # Each worker loads its own copy on its assigned GPU.
+    # This avoids memory contention and accelerate hook issues.
     model_device = next(model.parameters()).device
-    model = model.to("cpu")
-    torch.cuda.empty_cache()
-    for i in range(torch.cuda.device_count()):
-        torch.cuda.set_device(i)
+    if model_device.type == "cuda":
+        logger.info("Moving model to CPU to free GPU memory for workers...")
+        # Remove accelerate hooks before moving (they prevent .to() calls)
+        remove_hook_from_module(model, recurse=True)
+        model = model.to("cpu")
         torch.cuda.empty_cache()
+        for i in range(torch.cuda.device_count()):
+            torch.cuda.set_device(i)
+            torch.cuda.empty_cache()
     
     # Split calibration data across GPUs
     chunks = [[] for _ in range(len(gpus_to_use))]
@@ -715,9 +719,9 @@ def collect_layer_data(
         import os
         os.unlink(model_state_path)
     
-    # Move model back to original device
-    logger.info(f"Moving model back to {model_device}...")
-    model = model.to(model_device)
+    # Model stays on CPU for multi-GPU mode (merging happens on CPU anyway)
+    # This avoids accelerate hook issues and saves GPU memory for workers
+    logger.info("Model remains on CPU for merging operations")
     
     if not results:
         raise RuntimeError(f"All GPU workers failed for layer {layer_idx}")
