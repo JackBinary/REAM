@@ -765,7 +765,7 @@ def load_ream_calibration_data(
     tokenizer: AutoTokenizer,
     max_length: int = 2048,
     c4_samples: int = 512,
-    math_samples: int = 1024,
+    math_samples: int = 512,
     code_samples: int = 512,
     roleplay_samples: int = 512,
     c4_max_tokens: int = 128,
