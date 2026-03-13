@@ -167,54 +167,88 @@ def collect_layer_data(
                 gate_out = gate_out[0]
             gate_probs = F.softmax(gate_out, dim=-1)
 
-        # Compute expert outputs for all experts
+        # Compute expert outputs for all experts - optimized batch computation
         expert_outs = torch.zeros(
             num_experts, n_tokens, moe_input.shape[-1],
             device=device, dtype=moe_input.dtype
         )
+        
         if is_fused:
+            # For fused experts, we need to compute sequentially but can still optimize
             for i in range(num_experts):
                 expert_outs[i] = fused_expert_forward(experts, i, moe_input)
         else:
+            # For non-fused experts, we can compute in parallel using vmap or manual batching
+            # Since experts are separate modules, we need to compute sequentially
+            # but we can at least keep everything on GPU
             for i, expert in enumerate(experts):
                 expert_outs[i] = expert(moe_input)
 
-        # Move to CPU once, then free GPU copy
-        expert_outs_cpu = expert_outs.cpu()
-        gate_probs_cpu = gate_probs.cpu()
-        del expert_outs
-
-        # --- Online REAP score computation ---
-        topk_values, topk_indices = torch.topk(gate_probs_cpu, k=topk, dim=-1)
-        for i in range(num_experts):
-            mask = (topk_indices == i).any(dim=-1)
-            if not mask.any():
-                continue
-            count = mask.sum().float()
-            expert_frequency[i] += count
-            expert_state = expert_outs_cpu[i, mask]
-            gate_vals = gate_probs_cpu[mask, i]
-            norms = expert_state.norm(dim=-1)
-            reap_numer[i] += (norms * gate_vals).sum()
-            reap_denom[i] += count
-
-            # Accumulate expert_hidden (capped per expert)
-            if i not in expert_hidden:
-                expert_hidden[i] = expert_state.T[:, :max_hidden_tokens]
-            elif expert_hidden[i].shape[1] < max_hidden_tokens:
-                remaining = max_hidden_tokens - expert_hidden[i].shape[1]
-                expert_hidden[i] = torch.cat(
-                    [expert_hidden[i], expert_state[:remaining].T], dim=1
-                )
-
+        # Keep computations on GPU as much as possible
+        # --- Online REAP score computation (GPU optimized) ---
+        topk_values, topk_indices = torch.topk(gate_probs, k=topk, dim=-1)
+        
+        # Create mask for each expert (num_experts, n_tokens) on GPU - vectorized
+        # Expand topk_indices for comparison with all experts
+        topk_expanded = topk_indices.unsqueeze(0).expand(num_experts, -1, -1)  # (num_experts, n_tokens, topk)
+        expert_range = torch.arange(num_experts, device=device).view(-1, 1, 1)  # (num_experts, 1, 1)
+        expert_mask = (topk_expanded == expert_range).any(dim=-1)  # (num_experts, n_tokens)
+        
+        # Compute counts and REAP scores on GPU
+        counts = expert_mask.sum(dim=1).float()
+        expert_frequency += counts.cpu()
+        
+        # Compute norms for all experts at once (GPU)
+        norms = expert_outs.norm(dim=-1)  # (num_experts, n_tokens)
+        
+        # Compute REAP numerator contributions on GPU - vectorized
+        # Multiply norms with gate_probs (transposed) and mask
+        gate_probs_t = gate_probs.T  # (num_experts, n_tokens)
+        weighted_norms = norms * gate_probs_t  # (num_experts, n_tokens)
+        # Apply mask and sum
+        reap_contributions = (weighted_norms * expert_mask.float()).sum(dim=1)
+        
+        reap_numer += reap_contributions.cpu()
+        reap_denom += counts.cpu()
+        
         # --- Keep a capped reservoir for similarity matrix ---
         if sim_tokens_collected < max_sim_tokens:
             n_keep = min(n_tokens, max_sim_tokens - sim_tokens_collected)
-            sim_expert_outputs.append(expert_outs_cpu[:, :n_keep, :])
-            sim_gate_logits.append(gate_probs_cpu[:n_keep, :])
+            # Only move the needed slice to CPU
+            sim_expert_outputs.append(expert_outs[:, :n_keep, :].cpu())
+            sim_gate_logits.append(gate_probs[:n_keep, :].cpu())
             sim_tokens_collected += n_keep
-
-        del expert_outs_cpu, gate_probs_cpu
+        
+        # Accumulate expert_hidden (capped per expert) - process on GPU then move to CPU
+        for i in range(num_experts):
+            if not expert_mask[i].any():
+                continue
+                
+            # Get expert outputs for this expert (still on GPU)
+            expert_state_gpu = expert_outs[i, expert_mask[i]]
+            
+            # Move only the needed amount to CPU
+            if i not in expert_hidden:
+                # Take first max_hidden_tokens tokens
+                n_to_take = min(expert_state_gpu.shape[0], max_hidden_tokens)
+                expert_hidden[i] = expert_state_gpu[:n_to_take].T.cpu()
+            elif expert_hidden[i].shape[1] < max_hidden_tokens:
+                remaining = max_hidden_tokens - expert_hidden[i].shape[1]
+                if remaining > 0:
+                    n_to_take = min(expert_state_gpu.shape[0], remaining)
+                    expert_hidden[i] = torch.cat(
+                        [expert_hidden[i], expert_state_gpu[:n_to_take].T.cpu()], dim=1
+                    )
+        
+        # Clean up GPU memory
+        del expert_outs, expert_mask, norms, reap_contributions, gate_probs_t, weighted_norms
+        if 'expert_state_gpu' in locals():
+            del expert_state_gpu
+        if 'topk_expanded' in locals():
+            del topk_expanded
+        if 'expert_range' in locals():
+            del expert_range
+        
         total_tokens += n_tokens
 
     hook.remove()
