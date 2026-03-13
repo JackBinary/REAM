@@ -409,6 +409,17 @@ class MergeArgs:
             )
         },
     )
+    load_in_8bit: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Load model in 8-bit quantization for multi-GPU mode. "
+                "Reduces VRAM usage by ~50% (e.g., 64GB -> 32GB). "
+                "Useful when model doesn't fit in GPU memory. "
+                "Requires bitsandbytes. Default: False."
+            )
+        },
+    )
 
 @dataclass
 class KdArgs:

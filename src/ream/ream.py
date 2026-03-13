@@ -68,6 +68,7 @@ def _collect_layer_data_worker(
     max_hidden_tokens: int,
     num_gpus: int,
     result_queue,
+    load_in_8bit: bool = False,
 ):
     """Worker function for multi-GPU layer data collection. Must be at module level for pickling."""
     import torch
@@ -78,21 +79,64 @@ def _collect_layer_data_worker(
         torch.cuda.set_device(gpu_id)
         device = torch.device(f"cuda:{gpu_id}")
         
-        # Load a fresh copy of the model on this GPU
+        # Load model on CPU first (full precision) and load merged state
         local_model = load_model_text_only(
             model_name,
-            device_map={"": device},
-            torch_dtype="auto",
+            device_map="cpu",
+            torch_dtype=torch.float16,  # Use fp16 for efficiency
             trust_remote_code=True,
         )
         
-        # Load the (possibly merged) state from disk (avoids file descriptor limits)
-        model_state = torch.load(model_state_path, map_location=device, weights_only=True)
+        # Load the merged state dict from disk (full precision, from main process)
+        model_state = torch.load(model_state_path, map_location="cpu", weights_only=True)
         local_model.load_state_dict(model_state)
         local_model.eval()
         
+        # Now quantize and move to GPU if requested
+        if load_in_8bit:
+            # Use accelerate to quantize and dispatch to GPU
+            from accelerate import dispatch_model, infer_auto_device_map
+            from accelerate.utils import get_balanced_memory
+            
+            # Quantize model weights to int8 (in-place on CPU first)
+            import bitsandbytes as bnb
+            
+            def replace_linear_with_8bit(module, prefix=""):
+                """Recursively replace Linear layers with 8-bit versions."""
+                for name, child in module.named_children():
+                    full_name = f"{prefix}.{name}" if prefix else name
+                    if isinstance(child, torch.nn.Linear):
+                        # Skip gate/router layers for accuracy
+                        if "gate" in full_name.lower():
+                            continue
+                        # Create 8-bit replacement
+                        new_linear = bnb.nn.Linear8bitLt(
+                            child.in_features,
+                            child.out_features,
+                            has_fp16_weights=False,
+                            threshold=6.0,
+                        )
+                        # Quantize weights
+                        new_linear.weight = bnb.nn.Int8Params(
+                            child.weight.data,
+                            requires_grad=False,
+                            has_fp16_weights=False,
+                        )
+                        if child.bias is not None:
+                            new_linear.bias = child.bias
+                        setattr(module, name, new_linear)
+                    else:
+                        replace_linear_with_8bit(child, full_name)
+            
+            replace_linear_with_8bit(local_model)
+            
+            # Move to GPU
+            local_model = local_model.to(device)
+        else:
+            # Full precision - just move to GPU
+            local_model = local_model.to(device)
+        
         # Collect data - need to call the single-GPU version
-        # We pass the function reference to avoid circular import issues
         result = collect_layer_data_single_gpu(
             model=local_model,
             calibration_inputs=calib_chunk,
@@ -565,6 +609,7 @@ def collect_layer_data(
     max_hidden_tokens: int = 8192,
     num_gpus: int = 1,
     temp_dir: Optional[pathlib.Path] = None,
+    load_in_8bit: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     Forward calibration data through the model up to and including the target
@@ -588,6 +633,7 @@ def collect_layer_data(
         max_hidden_tokens: Maximum tokens per expert to retain for permutation
             alignment in expert_hidden.
         num_gpus: Number of GPUs to use in parallel (default: 1)
+        load_in_8bit: Load model in 8-bit quantization to reduce VRAM (default: False)
 
     Returns a dict with:
       - reap_scores: (N,) per-expert REAP saliency
@@ -648,14 +694,16 @@ def collect_layer_data(
     # This avoids memory contention and accelerate hook issues.
     model_device = next(model.parameters()).device
     if model_device.type == "cuda":
+        # Model was loaded on GPU (single-GPU fallback), need to move to CPU
         logger.info("Moving model to CPU to free GPU memory for workers...")
-        # Remove accelerate hooks before moving (they prevent .to() calls)
         remove_hook_from_module(model, recurse=True)
         model = model.to("cpu")
         torch.cuda.empty_cache()
         for i in range(torch.cuda.device_count()):
             torch.cuda.set_device(i)
             torch.cuda.empty_cache()
+    else:
+        logger.info("Model already on CPU for multi-GPU processing")
     
     # Split calibration data across GPUs
     chunks = [[] for _ in range(len(gpus_to_use))]
@@ -699,7 +747,8 @@ def collect_layer_data(
             p = mp.Process(
                 target=_collect_layer_data_worker,
                 args=(gpu_id, chunk, model_name, model_state_path, layer_idx, 
-                      model_attrs, max_sim_tokens, max_hidden_tokens, num_gpus, result_queue)
+                      model_attrs, max_sim_tokens, max_hidden_tokens, num_gpus, 
+                      result_queue, load_in_8bit)
             )
             p.start()
             processes.append(p)
@@ -985,6 +1034,7 @@ def ream_sequential_merge(
     resume_from_checkpoint: Optional[pathlib.Path] = None,
     num_gpus: int = 1,
     num_workers: int = 8,
+    load_in_8bit: bool = False,
 ) -> dict:
     """
     Run the full REAM sequential merging pipeline with checkpointing support.
@@ -1136,6 +1186,7 @@ def ream_sequential_merge(
                 device=device,
                 num_gpus=num_gpus,
                 temp_dir=results_dir,
+                load_in_8bit=load_in_8bit,
             )
 
             # Run REAM merge for this layer
@@ -1266,9 +1317,11 @@ def load_ream_calibration_data(
     c4_samples: int = 512,
     math_samples: int = 1024,
     code_samples: int = 512,
+    roleplay_samples: int = 512,
     c4_max_tokens: int = 128,
     math_max_tokens: int = 512,
     code_max_tokens: int = 512,
+    roleplay_max_tokens: int = 512,
     seed: int = 42,
     num_workers: int = 8,
 ) -> list[torch.Tensor]:
@@ -1277,10 +1330,11 @@ def load_ream_calibration_data(
 
     Uses multiprocessing to parallelize tokenization across CPU cores.
 
-    Table 1 from the blog post:
-      - General: allenai/c4/en (512 samples, 128 max tokens, ~8% of data)
-      - Math: AI-MO/NuminaMath-1.5 cn_k12+olympiads (1024 samples, 512 max tokens, ~68%)
-      - Coding: bigcode/the-stack-smol (512 samples, 512 max tokens, ~24%)
+    Calibration data composition:
+      - General: allenai/c4/en (512 samples, 128 max tokens)
+      - Math: AI-MO/NuminaMath-1.5 cn_k12+olympiads (1024 samples, 512 max tokens)
+      - Coding: bigcode/the-stack-smol (512 samples, 512 max tokens)
+      - Creative/Roleplay: Gryphe/ChatGDUniverse (512 samples, 512 max tokens)
 
     Args:
         tokenizer: The model tokenizer
@@ -1288,9 +1342,11 @@ def load_ream_calibration_data(
         c4_samples: Number of C4 samples
         math_samples: Number of math samples
         code_samples: Number of coding samples
+        roleplay_samples: Number of roleplay/creative writing samples
         c4_max_tokens: Max tokens per C4 sample
         math_max_tokens: Max tokens per math sample
         code_max_tokens: Max tokens per code sample
+        roleplay_max_tokens: Max tokens per roleplay sample
         seed: Random seed
         num_workers: Number of CPU workers for parallel tokenization (default: 8)
 
@@ -1411,6 +1467,57 @@ def load_ream_calibration_data(
     except Exception as e:
         logger.warning(f"Failed to load the-stack-smol data: {e}. Skipping.")
 
+    # 4. Creative/Roleplay (bluemoon_roleplay_chat_data - 300k roleplay messages)
+    logger.info("Loading roleplay/creative writing calibration data...")
+    try:
+        roleplay_ds = load_dataset(
+            "rickRossie/bluemoon_roleplay_chat_data_300k_messages",
+            split="train",
+            streaming=False,
+            trust_remote_code=True,
+        )
+        roleplay_indices = random.sample(range(len(roleplay_ds)), min(roleplay_samples, len(roleplay_ds)))
+        # Use the 'message' field which contains the roleplay text
+        # Optionally prepend thread_title for context
+        roleplay_texts = []
+        for idx in roleplay_indices:
+            item = roleplay_ds[idx]
+            message = item.get("message", "")
+            thread_title = item.get("thread_title", "")
+            # Combine thread title (scenario) with message for context
+            if thread_title and thread_title != message:
+                text = f"[{thread_title}]\n{message}"
+            else:
+                text = message
+            roleplay_texts.append(text)
+        
+        roleplay_tokens = tokenize_parallel(roleplay_texts, roleplay_max_tokens, "roleplay")
+        all_inputs.extend(roleplay_tokens)
+        logger.info(f"Loaded {len(roleplay_tokens)} roleplay samples")
+    except Exception as e:
+        logger.warning(f"Failed to load roleplay data: {e}. Trying alternative dataset...")
+        # Fallback to another creative writing dataset
+        try:
+            roleplay_ds = load_dataset(
+                "HuggingFaceTB/cosmopedia-100k",
+                split="train",
+                streaming=False,
+                trust_remote_code=True,
+            )
+            # Filter for creative/story categories
+            roleplay_ds = roleplay_ds.filter(
+                lambda x: x.get("format", "") in ["story", "creative"],
+                num_proc=num_workers,
+            )
+            roleplay_indices = random.sample(range(len(roleplay_ds)), min(roleplay_samples, len(roleplay_ds)))
+            roleplay_texts = [roleplay_ds[idx].get("text", "") for idx in roleplay_indices]
+            
+            roleplay_tokens = tokenize_parallel(roleplay_texts, roleplay_max_tokens, "creative writing")
+            all_inputs.extend(roleplay_tokens)
+            logger.info(f"Loaded {len(roleplay_tokens)} creative writing samples (fallback)")
+        except Exception as e2:
+            logger.warning(f"Failed to load creative writing data: {e2}. Skipping.")
+
     if not all_inputs:
         raise RuntimeError("No calibration data loaded. Check dataset availability.")
 
@@ -1471,12 +1578,27 @@ def main():
     # Load model
     model_name = patched_model_map(model_args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = load_model_text_only(
-        model_name,
-        device_map="auto",
-        torch_dtype="auto",
-        trust_remote_code=True,
-    )
+    
+    # Get num_gpus before loading model
+    num_gpus = getattr(merge_args, 'num_gpus', 1)
+    
+    # For multi-GPU mode, load model on CPU to avoid memory contention
+    # Each worker will load its own copy on its assigned GPU
+    if num_gpus > 1:
+        logger.info(f"Multi-GPU mode ({num_gpus} GPUs): loading model on CPU")
+        model = load_model_text_only(
+            model_name,
+            device_map="cpu",
+            torch_dtype="auto",
+            trust_remote_code=True,
+        )
+    else:
+        model = load_model_text_only(
+            model_name,
+            device_map="auto",
+            torch_dtype="auto",
+            trust_remote_code=True,
+        )
 
     model_attrs = MODEL_ATTRS[model.__class__.__name__]
     device = next(model.parameters()).device
@@ -1551,6 +1673,7 @@ def main():
         resume_from_checkpoint=resume_checkpoint,
         num_gpus=getattr(merge_args, 'num_gpus', 1),
         num_workers=getattr(merge_args, 'num_workers', 8),
+        load_in_8bit=getattr(merge_args, 'load_in_8bit', False),
     )
 
     cluster_labels = result["cluster_labels"]
