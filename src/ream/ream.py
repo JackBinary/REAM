@@ -779,8 +779,9 @@ def load_ream_calibration_data(
 
     Table 1 from the blog post:
       - General: allenai/c4/en (512 samples, 128 max tokens, ~8% of data)
-      - Math: AI-MO/NuminaMath-1.5 cn_k12+olympiads (1024 samples, 512 max tokens, ~68%)
-      - Coding: bigcode/the-stack-smol (512 samples, 512 max tokens, ~24%)
+      - Math: AI-MO/NuminaMath-1.5 cn_k12+olympiads (512 samples, 512 max tokens, ~31%)
+      - Coding: bigcode/the-stack-smol (512 samples, 512 max tokens, ~31%)
+      - Roleplay/Creative: rickRossie/bluemoon_roleplay_chat_data_300k_messages (512 samples, 512 max tokens, ~31%)
 
     Args:
         tokenizer: The model tokenizer
@@ -791,6 +792,7 @@ def load_ream_calibration_data(
         c4_max_tokens: Max tokens per C4 sample
         math_max_tokens: Max tokens per math sample
         code_max_tokens: Max tokens per code sample
+        roleplay_max_tokens: Max tokens per roleplay sample
         seed: Random seed
 
     Returns:
@@ -801,8 +803,8 @@ def load_ream_calibration_data(
     torch.manual_seed(seed)
     
     logger.info(f"Loading REAM mixed calibration data with seed {seed}...")
-    logger.info(f"Dataset mix: C4={c4_samples}, Math={math_samples}, Code={code_samples}")
-    logger.info(f"Token limits: C4={c4_max_tokens}, Math={math_max_tokens}, Code={code_max_tokens}")
+    logger.info(f"Dataset mix: C4={c4_samples}, Math={math_samples}, Code={code_samples}, Roleplay={roleplay_samples}")
+    logger.info(f"Token limits: C4={c4_max_tokens}, Math={math_max_tokens}, Code={code_max_tokens}, Roleplay={roleplay_max_tokens}")
 
     all_inputs = []
 
