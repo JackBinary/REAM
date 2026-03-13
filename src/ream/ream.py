@@ -643,6 +643,16 @@ def collect_layer_data(
     gpus_to_use = available_gpus[:num_gpus]
     logger.info(f"Using {len(gpus_to_use)} GPUs in parallel: {gpus_to_use}")
     
+    # Move model to CPU to free GPU memory before spawning workers
+    # Each worker will load its own copy on its assigned GPU
+    logger.info("Moving model to CPU to free GPU memory for workers...")
+    model_device = next(model.parameters()).device
+    model = model.to("cpu")
+    torch.cuda.empty_cache()
+    for i in range(torch.cuda.device_count()):
+        torch.cuda.set_device(i)
+        torch.cuda.empty_cache()
+    
     # Split calibration data across GPUs
     chunks = [[] for _ in range(len(gpus_to_use))]
     for i, inp in enumerate(calibration_inputs):
@@ -704,6 +714,10 @@ def collect_layer_data(
         # Clean up temp file
         import os
         os.unlink(model_state_path)
+    
+    # Move model back to original device
+    logger.info(f"Moving model back to {model_device}...")
+    model = model.to(model_device)
     
     if not results:
         raise RuntimeError(f"All GPU workers failed for layer {layer_idx}")
