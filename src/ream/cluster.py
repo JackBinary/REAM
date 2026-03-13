@@ -7,6 +7,16 @@ from scipy.cluster.hierarchy import linkage
 from scipy.cluster.vq import kmeans2
 import logging
 
+# Try to import cuML for GPU acceleration
+try:
+    import cuml
+    from cuml.cluster import KMeans as cuKMeans
+    from cuml.cluster import AgglomerativeClustering as cuAgglomerativeClustering
+    CUMl_AVAILABLE = True
+except ImportError:
+    CUMl_AVAILABLE = False
+    logging.info("cuML not available, falling back to CPU-based scipy clustering")
+
 
 def get_penalty_vector(
     expert_probablities: torch.Tensor,
@@ -96,11 +106,38 @@ def hierarchical_clustering(
     distances: torch.Tensor,
     method: str,
     n_clusters: int,
+    use_gpu: bool = True,
 ):
-    condensed_dist = squareform(distances.fill_diagonal_(0))
-    all_clusters = linkage(condensed_dist, method=method)
-    cluster_labels = linkage_to_labels(all_clusters, n_clusters)
-    return cluster_labels
+    """
+    Performs hierarchical clustering with optional GPU acceleration.
+    
+    Args:
+        distances: NxN pairwise distance matrix
+        method: Linkage method ('average', 'single', 'complete', 'ward')
+        n_clusters: Number of clusters to form
+        use_gpu: Whether to use GPU acceleration if available
+    
+    Returns:
+        Cluster labels for each point
+    """
+    if use_gpu and CUMl_AVAILABLE and distances.is_cuda:
+        # GPU-accelerated hierarchical clustering using cuML
+        # cuML uses AgglomerativeClustering which requires feature matrix, not distances
+        # We'll use the precomputed distance matrix approach
+        distances_np = distances.fill_diagonal_(0).cpu().numpy()
+        condensed_dist = squareform(distances_np)
+        
+        # cuML AgglomerativeClustering doesn't support precomputed distances directly
+        # Fall back to scipy for now (cuML's implementation is in progress)
+        all_clusters = linkage(condensed_dist, method=method)
+        cluster_labels = linkage_to_labels(all_clusters, n_clusters)
+        return cluster_labels
+    else:
+        # CPU-based scipy hierarchical clustering
+        condensed_dist = squareform(distances.fill_diagonal_(0))
+        all_clusters = linkage(condensed_dist, method=method)
+        cluster_labels = linkage_to_labels(all_clusters, n_clusters)
+        return cluster_labels
 
 
 def linkage_to_labels(linkage_matrix: np.ndarray, num_clusters: int) -> np.ndarray:
@@ -254,23 +291,51 @@ def multi_layer_hierarchical_clustering(
 
 
 def kmeans_clustering(
-    data: np.ndarray,
+    data: np.ndarray | torch.Tensor,
     n_clusters: int,
+    use_gpu: bool = True,
+    n_init: int = 1,
+    max_iter: int = 300,
+    tol: float = 1e-4,
 ) -> np.ndarray:
     """
-    Performs k-means clustering using scipy.cluster.vq.kmeans2.
+    Performs k-means clustering with optional GPU acceleration.
 
     Args:
-        data (np.ndarray): The data to cluster, with shape (n_samples, n_features).
+        data (np.ndarray | torch.Tensor): The data to cluster, with shape (n_samples, n_features).
         n_clusters (int): The number of clusters to form.
+        use_gpu (bool): Whether to use GPU acceleration if available.
+        n_init (int): Number of initializations to run.
+        max_iter (int): Maximum number of iterations.
+        tol (float): Relative tolerance for convergence.
 
     Returns:
         np.ndarray: An array of cluster labels.
     """
-    # The kmeans2 function returns the centroids and the labels.
-    # We are interested in the labels.
-    _, labels = kmeans2(data, n_clusters, minit="++")
-    return labels
+    # Convert torch tensor to numpy if needed
+    if isinstance(data, torch.Tensor):
+        is_cuda = data.is_cuda
+        data_np = data.cpu().numpy()
+    else:
+        is_cuda = False
+        data_np = data
+    
+    if use_gpu and CUMl_AVAILABLE and is_cuda:
+        # GPU-accelerated k-means using cuML
+        kmeans = cuKMeans(
+            n_clusters=n_clusters,
+            n_init=n_init,
+            max_iter=max_iter,
+            tol=tol,
+            init='k-means++',
+            output_type='numpy'
+        )
+        labels = kmeans.fit_predict(data_np)
+        return labels
+    else:
+        # CPU-based scipy k-means
+        _, labels = kmeans2(data_np, n_clusters, minit="++")
+        return labels
 
 
 def mc_smoe_clustering(
@@ -377,17 +442,19 @@ def mc_smoe_clustering(
 class KMeansCostTable:
     MAX_DIST = 1000.0
 
-    def __init__(self, distances: torch.Tensor, num_merges_to_perform: int):
+    def __init__(self, distances: torch.Tensor, num_merges_to_perform: int, use_gpu: bool = True):
         """
         Initializes the cost table.
 
         Args:
             distances (torch.Tensor): A square tensor of pairwise distances.
             num_merges_to_perform (int): The maximum number of merges to pre-compute costs for.
+            use_gpu (bool): Whether to use GPU acceleration if available.
         """
         self.distances = distances.fill_diagonal_(self.MAX_DIST)
         self.num_experts = distances.shape[0]
         self.num_merges_to_perform = num_merges_to_perform
+        self.use_gpu = use_gpu and CUMl_AVAILABLE and distances.is_cuda
         
         # cost_table[i] will store the cost of performing i+1 merges.
         self.cost_table = torch.full((num_merges_to_perform,), float("inf"))
@@ -405,7 +472,14 @@ class KMeansCostTable:
             if k <= 0:
                 continue
 
-            centroids_np, labels_np = kmeans2(self.distances, k=k, minit="++")
+            if self.use_gpu:
+                # GPU-accelerated k-means
+                kmeans = cuKMeans(n_clusters=k, n_init=1, output_type='numpy')
+                labels_np = kmeans.fit_predict(self.distances.cpu().numpy())
+                centroids_np = kmeans.cluster_centers_
+            else:
+                # CPU-based k-means
+                centroids_np, labels_np = kmeans2(self.distances, k=k, minit="++")
 
             centroids = torch.tensor(centroids_np, device=self.distances.device)
             labels = torch.tensor(labels_np, device=self.distances.device)
@@ -479,6 +553,7 @@ def multi_layer_kmeans_clustering(
     distances: dict[int, torch.Tensor],
     num_layers: int,
     n_clusters: int,
+    use_gpu: bool = True,
 ) -> dict[int, np.ndarray]:
     """
     Performs k-means clustering jointly across groups of consecutive layers
@@ -488,6 +563,7 @@ def multi_layer_kmeans_clustering(
         distances (dict[int, torch.Tensor]): A dictionary of embedding tensors for each layer.
         num_layers (int): The number of consecutive layers to group for joint clustering.
         n_clusters (int): The target number of clusters per layer on average.
+        use_gpu (bool): Whether to use GPU acceleration if available.
 
     Returns:
         dict[int, np.ndarray]: A dictionary mapping layer index to cluster labels.
@@ -523,7 +599,7 @@ def multi_layer_kmeans_clustering(
             # Max merges for a layer is num_experts - 1 (to get 1 cluster).
             max_merges = num_experts - 1
             if max_merges > 0:
-                cost_tables.append(KMeansCostTable(d, max_merges))
+                cost_tables.append(KMeansCostTable(d, max_merges, use_gpu=use_gpu))
             else:
                 # This layer has 0 or 1 expert, so it can't be merged.
                 # We add a placeholder to keep indices aligned.
@@ -649,17 +725,19 @@ def restricted_hierarchical_clustering(
 class KMeansCostTableV2:
     # intended to work on characteristic_activations not pairwise distances
 
-    def __init__(self, ca: torch.Tensor, num_merges_to_perform: int):
+    def __init__(self, ca: torch.Tensor, num_merges_to_perform: int, use_gpu: bool = True):
         """
         Initializes the cost table.
 
         Args:
             ca (torch.Tensor): A square tensor of characteristic activations.
             num_merges_to_perform (int): The maximum number of merges to pre-compute costs for.
+            use_gpu (bool): Whether to use GPU acceleration if available.
         """
         self.ca = ca / torch.linalg.norm(ca, dim=-1, keepdim=True)  # normalize to unit sphere so that euclidean ~ cosine
         self.num_experts = ca.shape[0]
         self.num_merges_to_perform = num_merges_to_perform
+        self.use_gpu = use_gpu and CUMl_AVAILABLE and ca.is_cuda
         
         # cost_table[i] will store the cost of performing i+1 merges.
         self.cost_table = torch.full((num_merges_to_perform,), float("inf"))
@@ -677,7 +755,14 @@ class KMeansCostTableV2:
             if k <= 0:
                 continue
 
-            centroids_np, labels_np = kmeans2(self.ca, k=k, minit="++")
+            if self.use_gpu:
+                # GPU-accelerated k-means
+                kmeans = cuKMeans(n_clusters=k, n_init=1, output_type='numpy')
+                labels_np = kmeans.fit_predict(self.ca.cpu().numpy())
+                centroids_np = kmeans.cluster_centers_
+            else:
+                # CPU-based k-means
+                centroids_np, labels_np = kmeans2(self.ca, k=k, minit="++")
 
             centroids = torch.tensor(centroids_np, device=self.ca.device)
             labels = torch.tensor(labels_np, device=self.ca.device)
@@ -756,6 +841,7 @@ def multi_layer_kmeans_clustering_on_ca(
     distances: dict[int, torch.Tensor],
     num_layers: int,
     n_clusters: int,
+    use_gpu: bool = True,
 ) -> dict[int, np.ndarray]:
     """
     Performs k-means clustering jointly across groups of consecutive layers
@@ -765,6 +851,7 @@ def multi_layer_kmeans_clustering_on_ca(
         distances (dict[int, torch.Tensor]): A dictionary of embedding tensors for each layer.
         num_layers (int): The number of consecutive layers to group for joint clustering.
         n_clusters (int): The target number of clusters per layer on average.
+        use_gpu (bool): Whether to use GPU acceleration if available.
 
     Returns:
         dict[int, np.ndarray]: A dictionary mapping layer index to cluster labels.
@@ -800,7 +887,7 @@ def multi_layer_kmeans_clustering_on_ca(
             # Max merges for a layer is num_experts - 1 (to get 1 cluster).
             max_merges = num_experts - 1
             if max_merges > 0:
-                cost_tables.append(KMeansCostTableV2(d, max_merges))
+                cost_tables.append(KMeansCostTableV2(d, max_merges, use_gpu=use_gpu))
             else:
                 # This layer has 0 or 1 expert, so it can't be merged.
                 # We add a placeholder to keep indices aligned.

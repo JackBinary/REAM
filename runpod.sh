@@ -16,6 +16,12 @@ python3.12 -m venv .venv
 .venv/bin/python -m uv pip install --upgrade pip setuptools wheel && \
 VLLM_USE_PRECOMPILED=1 .venv/bin/python -m uv pip install --editable . --torch-backend auto && \
 .venv/bin/python -m uv pip install "transformers==5.3.0"
+.venv/bin/python -m uv pip install \
+    --extra-index-url=https://pypi.nvidia.com \
+    "cudf-cu12==26.2.*" "dask-cudf-cu12==26.2.*" "cuml-cu12==26.2.*" \
+    "cugraph-cu12==26.2.*" "nx-cugraph-cu12==26.2.*" "cuxfilter-cu12==26.2.*" \
+    "cucim-cu12==26.2.*" "pylibraft-cu12==26.2.*" "raft-dask-cu12==26.2.*" \
+    "cuvs-cu12==26.2.*" "nx-cugraph-cu12==26.2.*"
 
 # Run REAM
 .venv/bin/python patch_tokenizer.py llmfan46/Qwen3.5-35B-A3B-heretic-v2
